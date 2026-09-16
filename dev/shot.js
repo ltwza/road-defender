@@ -1,0 +1,328 @@
+/* ============================================================================
+ *  实机截图 —— 用系统里的 Chrome 无头模式给游戏拍真实渲染帧
+ *
+ *  为什么需要它：jsdom 里 canvas 是桩，只能断言坐标，看不到画面。
+ *  改视觉（场景装饰、配色、HUD）时，"断言全绿"说明不了好不好看，必须看图。
+ *
+ *  实现要点（踩过的坑）：
+ *    × 不要用 chrome --screenshot + --virtual-time-budget ——
+ *      游戏有一个常驻的 requestAnimationFrame 循环，页面永远不 idle，
+ *      虚拟时间根本推不动，拍到的永远是加载页。
+ *    √ 改成 CDP 驱动：起一个带 remote-debugging-port 的 Chrome，
+ *      用 WebSocket 连上去 → Page.navigate → 真时间等几秒 → Page.captureScreenshot。
+ *      Node 22 自带 WebSocket 和 fetch，不需要任何 npm 依赖。
+ *
+ *  另外会注入一小段脚本：跳过加载动画、直接开局，并把妖物钉在固定位置，
+ *  这样改前改后构图完全一致，能直接对比。
+ *
+ *  用法：
+ *    node dev/shot.js before            → dev/shots/before.png
+ *    node dev/shot.js hero --fire       → 保留玩家开火
+ *    node dev/shot.js hero --wait=6000  → 加载后再等 6 秒才拍
+ * ========================================================================== */
+const fs = require('fs');
+const path = require('path');
+const { spawn } = require('child_process');
+
+const DIR = path.join(__dirname, '..');
+const OUTDIR = path.join(__dirname, 'shots');
+const CHROME = 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
+
+const name = process.argv[2] || 'shot';
+const keepFire = process.argv.includes('--fire');
+const waitArg = process.argv.find((a) => a.startsWith('--wait='));
+const WAIT = waitArg ? parseInt(waitArg.slice(7), 10) : 4200;
+/* --clip=x,y,w,h 局部放大：480x900 整图缩到聊天窗口里只剩几百像素宽，
+ * 细节（树形、光池、边缘）根本看不清，必须能截一块放大来看。 */
+const clipArg = process.argv.find((a) => a.startsWith('--clip='));
+const CLIP = clipArg ? clipArg.slice(7).split(',').map(Number) : null;
+/* --dpr=N 拉高像素密度：装饰物是矢量填充，开销基本跟像素数走，
+ * DPR 1 测出来的数字对手机（DPR 2~3）没有参考价值。 */
+const dprArg = process.argv.find((a) => a.startsWith('--dpr='));
+const DPR = dprArg ? Math.max(1, Math.min(3, parseInt(dprArg.slice(6), 10) || 1)) : 1;
+const SEED = 20260916;
+const PORT = 9223;
+
+/* 钉住的场景：妖物绝不越过玩家，构图每次一致。
+ * 深度 17~86 米 → 覆盖"快到跟前 / 中景 / 远景"三档，正好能看出
+ * 妖物的大小递减和路两侧装饰物是否对得上（伪 3D 最容易穿帮的地方）。 */
+const STAGE = [
+  { key: 'elite', x: -1.33, y: 86 },
+  { key: 'brute', x: 1.33, y: 68 },
+  { key: 'slime', x: -1.33, y: 52 },
+  { key: 'bat', x: 0.0, y: 44 },
+  { key: 'slime', x: 1.33, y: 34 },
+  { key: 'slime', x: -1.33, y: 24 },
+  { key: 'slime', x: 1.33, y: 17 } // 这一只在攻击射程内 → 亮落点预警圈
+];
+
+const inject = `
+<script>
+(function () {
+  var SEED = ${SEED}, FIRE = ${keepFire ? 'true' : 'false'}, HOME = ${process.argv.includes('--home') ? 'true' : 'false'};
+  var OPEN = ${process.argv.includes('--stats') ? 'true' : 'false'};
+  var WRAP = ${process.argv.includes('--wrap') ? 'true' : 'false'};
+  var STAGE = ${JSON.stringify(STAGE)};
+  var s = SEED >>> 0;
+  Math.random = function () { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; };
+  var didOpen = false, didWrap = false;
+  var WRAP_N = 11;
+
+  /* --wrap：造 11 个真词条塞进 BUFF_LIST，用来验证"铺满往上换行"。
+   * 不能往 #icoRow 里直接插 DOM —— 图标行是 updateHud 整段 innerHTML 重写的，
+   * 插进去的下一帧就被冲掉了（第一版就是这么白忙的）。
+   * 挂到 BUFF_LIST 上才是走真实渲染路径。 */
+  function mkFake(i) {
+    return {
+      key: 't' + i, name: '测试' + i, color: '#8194ad', stackable: true,
+      icon: '<circle cx="12" cy="12" r="6.4"/><path d="M12 5.6v3.2"/>',
+      badge: function () { return '+' + (i + 1) * 7 + '%'; },
+      effect: function (n) { return '测试词条 ' + n + ' 层'; },
+      note: '仅供截图校验布局'
+    };
+  }
+
+  function tryStart() {
+    var home = document.getElementById('home');
+    var btn = document.getElementById('btnStart');
+    if (!home || !btn || home.classList.contains('hidden')) { setTimeout(tryStart, 40); return; }
+    if (HOME) return;                 // --home：停在主界面，拍首页背景
+    btn.click();
+    stage();
+  }
+
+  /* 每帧把场景钉回去（妖物位置会被 updatePlaying 改掉）。
+   * 本 rAF 在 game.js 之后注册 → 同帧内后执行 → 覆盖生效。 */
+  function stage() {
+    requestAnimationFrame(function tick() {
+      var D = window.RD;
+      if (D && D.G) {
+        var G = D.G;
+        G.t = 74;                          // HUD 显示个中局时间
+        G.hp = 78; G.score = 1280;         // 血条留点信息量
+        var b = { atk: 3, rate: 2, crit: 4, critDmg: 2 };
+        if (WRAP) {
+          if (!didWrap) {
+            didWrap = true;
+            for (var w = 0; w < WRAP_N; w++) D.BUFF_LIST.push(mkFake(w));
+          }
+          for (var w2 = 0; w2 < WRAP_N; w2++) b['t' + w2] = 1;
+        }
+        G.buffs = b;
+        G.weapon = 'twin';
+        if (!FIRE) G.fireTimer = 1e9;      // 关掉开火 → 画面更干净
+        if (OPEN && !didOpen) { didOpen = true; D.toggleStats(true); }
+
+        if (G.monsters.length !== STAGE.length) {
+          G.monsters.length = 0;
+          for (var i = 0; i < STAGE.length; i++) {
+            var st = STAGE[i], base = D.MONSTERS[st.key];
+            G.monsters.push({
+              key: st.key, type: base, x3d: st.x, y3d: st.y,
+              hp: 9999, maxHp: 9999, speed: base.speed, r: base.r, dmg: base.dmg,
+              wob: i * 1.1, mode: 'walk', modeT: 0, lungeX: st.x,
+              hitFlash: 0, dead: false
+            });
+          }
+        }
+        for (var j = 0; j < G.monsters.length; j++) {
+          var m = G.monsters[j], s0 = STAGE[j];
+          m.x3d = s0.x; m.y3d = s0.y; m.hp = 9999; m.dead = false;
+          /* 射程内那只永远停在预警阶段 —— 保证截图里一定看得见落点预警圈 */
+          if (s0.y === 17) {
+            if (m.mode !== 'windup' && m.mode !== 'lunge') { m.mode = 'windup'; m.modeT = 0; }
+            if (m.mode === 'windup' && m.modeT > m.type.windup * 0.72) m.modeT = m.type.windup * 0.5;
+            m.lungeX = 0.55;
+          }
+        }
+      }
+      requestAnimationFrame(tick);
+    });
+  }
+  setTimeout(tryStart, 50);
+})();
+</script>
+`;
+
+/* ---------- 生成临时页面 ----------
+ * 必须落在项目根目录：index.html 里用的是 <script src="projector.js"> 这种相对路径，
+ * 放 dev/ 下面会 ERR_FILE_NOT_FOUND，拍出来永远是加载页。 */
+const src = fs.readFileSync(path.join(DIR, 'index.html'), 'utf8');
+const tmp = path.join(DIR, '_shot.html');
+fs.writeFileSync(tmp, src.replace('</body>', inject + '</body>'), 'utf8');
+const url = 'file:///' + tmp.replace(/\\/g, '/');
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+(async function main() {
+  fs.mkdirSync(OUTDIR, { recursive: true });
+  const out = path.join(OUTDIR, name + '.png');
+  if (fs.existsSync(out)) fs.unlinkSync(out);
+
+  const userDir = path.join(__dirname, '_chrome-profile');
+  const chrome = spawn(CHROME, [
+    '--headless=new',
+    '--disable-gpu',
+    '--hide-scrollbars',
+    '--no-first-run',
+    '--no-default-browser-check',
+    '--enable-unsafe-swiftshader',
+    '--force-device-scale-factor=1',
+    '--window-size=480,900',
+    '--remote-debugging-port=' + PORT,
+    '--user-data-dir=' + userDir,
+    'about:blank'
+  ], { stdio: 'ignore' });
+
+  const cleanup = () => {
+    try { chrome.kill(); } catch (e) {}
+    try { fs.rmSync(userDir, { recursive: true, force: true }); } catch (e) {}
+    try { fs.unlinkSync(tmp); } catch (e) {}
+  };
+
+  try {
+    /* 等调试端口起来 */
+    let ver = null;
+    for (let i = 0; i < 60 && !ver; i++) {
+      await sleep(250);
+      try { ver = await (await fetch('http://127.0.0.1:' + PORT + '/json/version')).json(); } catch (e) {}
+    }
+    if (!ver) throw new Error('Chrome 调试端口没起来');
+
+    const list = await (await fetch('http://127.0.0.1:' + PORT + '/json/list')).json();
+    const page = list.find((t) => t.type === 'page');
+    if (!page) throw new Error('没找到 page target');
+
+    const ws = new WebSocket(page.webSocketDebuggerUrl);
+    await new Promise((res, rej) => { ws.onopen = res; ws.onerror = rej; });
+
+    let id = 0;
+    const pending = new Map();
+    const events = [];
+    ws.onmessage = (ev) => {
+      const msg = JSON.parse(ev.data);
+      if (msg.id && pending.has(msg.id)) { pending.get(msg.id)(msg); pending.delete(msg.id); }
+      else if (msg.method) events.push(msg.method);
+    };
+    const send = (method, params) => new Promise((res) => {
+      const myId = ++id;
+      pending.set(myId, res);
+      ws.send(JSON.stringify({ id: myId, method, params: params || {} }));
+    });
+
+    /* 页面里的报错要能看见，否则 "加载页永远不动" 根本查不出原因 */
+    const logs = [];
+    ws.addEventListener('message', (ev) => {
+      const m = JSON.parse(ev.data);
+      if (m.method === 'Runtime.consoleAPICalled') {
+        logs.push('[console.' + m.params.type + '] ' +
+          m.params.args.map((a) => a.value !== undefined ? a.value : a.description).join(' '));
+      } else if (m.method === 'Runtime.exceptionThrown') {
+        const d = m.params.exceptionDetails;
+        logs.push('[throw] ' + (d.exception && d.exception.description || d.text));
+      } else if (m.method === 'Log.entryAdded') {
+        logs.push('[log.' + m.params.entry.level + '] ' + m.params.entry.text);
+      }
+    });
+
+    await send('Log.enable');
+    await send('Page.enable');
+    await send('Runtime.enable');
+    await send('Emulation.setDeviceMetricsOverride', {
+      width: 480, height: 900, deviceScaleFactor: DPR, mobile: true
+    });
+    await send('Page.navigate', { url });
+
+    /* 等 load 事件（最多 8s），再多等一会儿让游戏跑起来 */
+    for (let i = 0; i < 80 && events.indexOf('Page.loadEventFired') < 0; i++) await sleep(100);
+    await sleep(WAIT);
+
+    /* 拍之前回报一下游戏是不是真的在跑 —— 否则拍到的可能又是加载页 */
+    const probe = await send('Runtime.evaluate', {
+      expression: 'JSON.stringify({state: (typeof RD!=="undefined"?RD.state:"NO_RD"), ' +
+        't: (typeof RD!=="undefined"&&RD.G)?+RD.G.t.toFixed(1):null, ' +
+        'mons: (typeof RD!=="undefined"&&RD.G)?RD.G.monsters.length:0, ' +
+        'scripts: document.scripts.length, w: innerWidth, h: innerHeight})',
+      returnByValue: true
+    });
+    console.log('probe: ' + JSON.stringify(probe.result));
+    console.log('events: ' + events.join(','));
+    if (logs.length) console.log('page logs:\n  ' + logs.join('\n  '));
+
+    /* --noscenery：把装饰整体关掉，用来量"装饰到底花了多少"。
+     * 直接改 RD.SCENE 就行 —— 场景是按世界里程即时推导的，没有缓存状态。 */
+    if (process.argv.includes('--noscenery')) {
+      await send('Runtime.evaluate', {
+        expression: 'RD.SCENE.belts.forEach(function(b){b.density=0;});' +
+          'RD.SCENE.lampSpacing=1e9;RD.SCENE.fireflies=0;'
+      });
+      await sleep(500);
+    }
+
+    /* --pick=x,y;x,y 直接读画布像素。
+     * 放大图看久了会看走眼（"这树是比背景亮还是暗？"），采样一下就没争议了。 */
+    const pickArg = process.argv.find((a) => a.startsWith('--pick='));
+    if (pickArg) {
+      const pts = pickArg.slice(7).split(';');
+      const expr = 'JSON.stringify(' + JSON.stringify(pts).replace(/"/g, "'") +
+        '.map(function (p) { var a = p.split(",");' +
+        'var d = document.getElementById("game").getContext("2d")' +
+        '.getImageData(+a[0], +a[1], 1, 1).data;' +
+        'return p + " rgb(" + d[0] + "," + d[1] + "," + d[2] + ")"; }))';
+      const pk = await send('Runtime.evaluate', { expression: expr, returnByValue: true });
+      console.log('pixels: ' + (pk.result && pk.result.result && pk.result.result.value));
+    }
+
+    /* 帧耗时：两侧铺了上百个装饰物，必须确认没把帧预算吃掉。
+     * 先清零统计，再跑一会儿，读 renderMs（累计平均，不是滑动平均）。
+     * 在页面里连着跑 120 帧，回报平均/最差单帧耗时与 DPR。 */
+    if (process.argv.includes('--perf')) {
+      await send('Runtime.evaluate', { expression: 'RD.perf.sum = 0; RD.perf.n = 0;' });
+      await sleep(1500);
+      const perf = await send('Runtime.evaluate', {
+        expression: `new Promise(function (res) {
+          var n = 0, t0 = performance.now(), worst = 0, prev = t0;
+          function f() {
+            var now = performance.now();
+            if (n > 0) worst = Math.max(worst, now - prev);
+            prev = now; n++;
+            if (n < 120) requestAnimationFrame(f);
+            else res(JSON.stringify({
+              avgMs: +((now - t0) / 120).toFixed(2),
+              worstMs: +worst.toFixed(2),
+              fps: +(120000 / (now - t0)).toFixed(1),
+              dpr: devicePixelRatio, w: innerWidth, h: innerHeight
+            }));
+          }
+          requestAnimationFrame(f);
+        })`,
+        awaitPromise: true, returnByValue: true
+      });
+      console.log('perf: ' + (perf.result && perf.result.result && perf.result.result.value));
+      const inner = await send('Runtime.evaluate', {
+        expression: 'JSON.stringify({renderMs: +RD.perf.renderMs.toFixed(2), frames: RD.perf.n, ' +
+          'dpr: devicePixelRatio})',
+        returnByValue: true
+      });
+      console.log('renderMs: ' + (inner.result && inner.result.result && inner.result.result.value));
+    }
+
+    const shotArgs = { format: 'png' };
+    if (CLIP && CLIP.length === 4) {
+      shotArgs.clip = { x: CLIP[0], y: CLIP[1], width: CLIP[2], height: CLIP[3], scale: 2 };
+    }
+    const shot = await send('Page.captureScreenshot', shotArgs);
+    const data = shot.result && shot.result.data;
+    if (!data) throw new Error('captureScreenshot 没返回数据');
+    fs.writeFileSync(out, Buffer.from(data, 'base64'));
+
+    ws.close();
+    cleanup();
+    console.log('ok ' + out + ' (' + Math.round(fs.statSync(out).size / 1024) + ' KB)');
+    process.exit(0);
+  } catch (e) {
+    console.log('FAIL ' + (e && e.message ? e.message : e));
+    cleanup();
+    process.exit(1);
+  }
+})();

@@ -1,0 +1,25 @@
+# ── 测试临时产物 ──
+# dev/ 下的脚本是长期维护的，但它们的输出报告是一次性的：
+# 每次跑都会覆盖，而且含大量环境相关的时间数字，提交进去只会污染 diff。
+dev/_*.txt
+_*.txt
+_probe.js
+
+# ── 调景期的对照截图 ──
+# before / after / after_mid 是当初判断"路两侧该不该加景、加得对不对"时拍的对照图，
+# 结论已经落进代码了，留在仓库里只会让人以为是当前效果。展示用图见 hud*.png。
+dev/shots/before.png
+dev/shots/after.png
+dev/shots/after_mid.png
+
+# ── 编辑器 / 系统 ──
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── 依赖与日志（本项目零依赖，但防止误装后提交） ──
+node_modules/
+*.log
+npm-debug.log*
