@@ -4,6 +4,10 @@
 
 目标只有一个：**撑满 180 秒**。妖物会主动向你扑击，你能做的只有左右挪步和还手。
 
+> **▶ 在线试玩：<https://ltwza.github.io/road-defender/>**
+>
+> 手机建议竖屏打开。分享到微信时若链接卡片没有缩略图，是抓取器还没缓存，过几分钟再发一次即可。
+
 <p align="center">
   <img src="dev/shots/hud.png" width="46%" alt="对局中">
   <img src="dev/shots/hud_stats.png" width="46%" alt="属性面板">

@@ -8,15 +8,20 @@
      链接丢进微信群/朋友圈时，微信和各家平台的抓取器只读静态 HTML，不跑 JS，
      所以标题取 <title>、摘要取下面的 description、缩略图取 og:image。
      没有这几行，群里显示的就是一条"光秃秃的网址"，点的人会明显变少。
-     og:image 按规范必须是绝对地址；cover.png 先用相对路径顶着 —— 等拿到
-     GitHub Pages 的正式网址后，把它换写成 https://<用户名>.github.io/<仓库名>/cover.png 才最稳。 -->
+
+     ⚠️ og:image / og:url **必须是绝对地址**，抓取器不会帮你补上域名。
+     换域名（自定义域名、改仓库名、迁到别的托管）时，这三行要跟着一起改。 -->
 <meta name="description" content="御剑封路 —— 三路妖物扑击的伪 3D 躲避射击小游戏。按住左右拖动御剑破阵，捡武器换流派，buff 可叠加，撑满 180 秒算通关。">
 <meta name="theme-color" content="#0b0d12">
 <meta name="format-detection" content="telephone=no">
 <meta property="og:type" content="website">
 <meta property="og:title" content="御剑封路 · Road Defender">
 <meta property="og:description" content="三路妖物扑击的伪 3D 躲避射击小游戏。按住左右拖动御剑破阵，撑满 180 秒算通关。">
-<meta property="og:image" content="cover.png">
+<meta property="og:url" content="https://ltwza.github.io/road-defender/">
+<meta property="og:image" content="https://ltwza.github.io/road-defender/dev/shots/cover.png">
+<meta property="og:image:width" content="480">
+<meta property="og:image:height" content="900">
+<meta property="og:image:alt" content="御剑封路游戏画面">
 <meta name="twitter:card" content="summary_large_image">
 <style>
   *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
