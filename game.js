@@ -32,6 +32,11 @@
     despawnDepth: -9,            // 越过玩家多远后回收
     roadViewDepth: 175,          // 路面条纹绘制范围
     roundDuration: 180,          // 存活即可通关的秒数
+    /* 通关奖励（金币）。为什么要有这一笔：单局收入完全由"打死多少只"决定，
+     * 于是"活着"本身没有任何经济价值 —— 玩家的最优解会变成在路中间硬拼而不是躲。
+     * 给一笔约等于多打死 120 只小妖（小妖掉 1 枚）的奖励，"撑满 3 分钟"才成为明确的最优策略。
+     * 数量按 dev/economy.js 量出来的单局收入（会躲的玩家约 520）折算：+120 ≈ 多两成。 */
+    coinBonusWin: 120,
     /* 判定半径刻意贴近人物画出来的身宽（约 0.6 米）：
      * 定得太大就会出现"看着没撞上却掉血"的憋屈感 */
     playerRadius: 0.38,
@@ -79,11 +84,20 @@
   };
   var WEAPON_KEYS = ['sword', 'twin', 'fan', 'cloud'];
 
+  /* coin = 击杀掉落的金币。它是**跨局持久**的货币（买地图/皮肤），
+   * 所以数值口径和 score 必须分开看：
+   *   · score 是"这一局打得好不好"，可以随手给（顺手一刀 +10 不心疼）；
+   *   · coin 是"值多少钱"，要经得起「一局能攒多少 × 价格」的对照。
+   * 取分档时按「击杀难度」而不是按血量线性走 —— 蛮兵/妖将挡路更久、更可能要放掉一次输出，
+   * 打掉它们就该明显更值钱，否则玩家没有动力先清硬怪（都去刷小妖了）。
+   * 相对关系：小妖 1 : 飞蝠 2 : 蛮兵 4 : 妖将 9。
+   * ⚠ 改这里的数之前先跑 dev/economy.js（它会用真实模拟玩家算出"一局平均收入"），
+   *   价格表（MAPS/SKINS 里的 price）就是按那个数定的 —— 只动一边必然失衡。 */
   var MONSTERS = {
-    slime: { key: 'slime', name: '小妖', hp: 20, speed: 1.9, r: 0.44, dmg: 8, score: 10, color: '#7ee081', dark: '#3d7a46', windup: 0.50, dash: 10 },
-    bat: { key: 'bat', name: '飞蝠', hp: 15, speed: 3.6, r: 0.34, dmg: 6, score: 16, color: '#c58bff', dark: '#6b46a0', windup: 0.40, dash: 15 },
-    brute: { key: 'brute', name: '蛮兵', hp: 55, speed: 1.4, r: 0.58, dmg: 14, score: 32, color: '#ff9366', dark: '#a3492b', windup: 0.72, dash: 8 },
-    elite: { key: 'elite', name: '妖将', hp: 115, speed: 1.6, r: 0.66, dmg: 18, score: 70, color: '#ffd166', dark: '#a37a17', windup: 0.64, dash: 9 }
+    slime: { key: 'slime', name: '小妖', hp: 20, speed: 1.9, r: 0.44, dmg: 8, score: 10, coin: 1, color: '#7ee081', dark: '#3d7a46', windup: 0.50, dash: 10 },
+    bat: { key: 'bat', name: '飞蝠', hp: 15, speed: 3.6, r: 0.34, dmg: 6, score: 16, coin: 2, color: '#c58bff', dark: '#6b46a0', windup: 0.40, dash: 15 },
+    brute: { key: 'brute', name: '蛮兵', hp: 55, speed: 1.4, r: 0.58, dmg: 14, score: 32, coin: 4, color: '#ff9366', dark: '#a3492b', windup: 0.72, dash: 8 },
+    elite: { key: 'elite', name: '妖将', hp: 115, speed: 1.6, r: 0.66, dmg: 18, score: 70, coin: 9, color: '#ffd166', dark: '#a37a17', windup: 0.64, dash: 9 }
   };
 
   /* 妖物的主动攻击节奏：进入射程 → 立刻锁定落点并蓄力（地面亮预警圈）→ 扑击 → 命中或扑空
@@ -229,6 +243,408 @@
     if (navigator.vibrate) { try { navigator.vibrate(ms); } catch (e) {} }
   }
 
+  /* ══════════════════ 主题 / 地图 / 皮肤 / 存档 ══════════════════
+   * 这是商城系统的地基，分三层，职责刻意分开：
+   *   主题（theme）—— 一张地图的**全部颜色与雾参数**。绘制代码只认主题、不认地图，
+   *                    换地图 = 换一个主题对象，绘制路径一行都不用改。
+   *   地图（MAPS） —— 主题覆盖 + 景物种类（belts 的 kinds）+ 价格。
+   *   皮肤（SKINS）—— 人物配色与体型参数（男/女各一套），与地图正交。
+   *
+   * ⚠ 夜图（night）的每个色值都必须是「抽主题之前」的原字面量，一个字节都不许漂。
+   *   这类重构最常见的翻车方式就是"顺手调一下"，然后用户发现熟悉的夜景变了样。
+   *   dev/shot.js 的 --region 可以逐像素比对改前改后，别靠肉眼。
+   *
+   * ⚠ 玩法性的颜色（妖物本体、血条、预警圈、伤害闪红、词条图标）**故意不进主题**：
+   *   它们必须跨地图完全一致 —— 换了张地图就得重新学"哪个圈是要命的"，
+   *   那不是美术，是 bug。
+   */
+  var BASE_THEME = {
+    /* 天空渐变（上 → 下），铺满整块画布，地面再盖住下半部分 */
+    sky: ['#080d18', '#121a2a', '#1a2130', '#0c1017'],
+    /* 地平线以下的地面（远 → 近） */
+    ground: ['#1a2333', '#131a26', '#0e131c'],
+    /* 两层远山剪影（远 → 近）+ 两条远树线（远 → 近） */
+    ridge: ['#131c29', '#0c131c'],
+    treeLine: ['#141d2b', '#111927'],
+    /* 地平线雾带的四个色标（上 → 下），中间那两个是"贴地平线"的浓度 */
+    haze: ['rgba(110,150,205,0)', 'rgba(104,144,200,0.055)',
+           'rgba(150,185,232,0.125)', 'rgba(120,160,215,0)'],
+    /* 路面（远 → 近）、横向条纹的 rgb 三元组、分隔虚线的整条 rgba */
+    road: ['#2c313d', '#232833', '#1a1e28'],
+    stripe: '160,190,240',
+    dash: 'rgba(200,222,255,0.24)',
+    /* 路沿：rgb 三元组 + 近端不透明度（远处靠 exp 衰减，见 drawCurb） */
+    curb: '120,190,255',
+    curbA: 0.55,
+    curbGlowA: 0.16,
+    /* 路肩碎石带 */
+    verge: '#141a24',
+    /* 空气透视：alpha = fogMin + (1−fogMin)·exp(−depth/fogD) */
+    fogMin: 0.30,
+    fogD: 75,
+    vig: 0.55,        // 暗角强度（白天/沙漠要弱得多，否则像被熏黑了）
+    flies: 14,        // 萤火/浮尘数量
+    /* 景物配色。名字按"用途"取，不按"长什么样"——
+     * 同一套绘制代码要在夜/昼/沙漠三种光线下都说得通。 */
+    P: {
+      grass: '#122219', bush: '#0f1c16', bushTop: '#14251c',
+      rock: '#0f151e', rockTop: '#171f2a',
+      trunk: '#080d12', pineA: '#0c1714', pineB: '#0a1310',
+      leafA: '#0b1611', leafB: '#0f1d16', edge: 'rgba(150,196,235,0.20)',
+      stalkA: '#122219', stalkB: '#16291e', leafC: '#193023',
+      pole: '#151d27', cloth: '#1e2c40', emblem: 'rgba(206,228,255,0.26)',
+      wall: '#1d2735', roof: '#26313f', window: 'rgba(255,188,112,0.62)',
+      eave: 'rgba(0,0,0,0.35)', stone: '#0a1017', tower: '#0d141d',
+      cactus: '#3f7048', cactusDark: '#2f5a38',
+      dune: '#c99a63', duneTop: '#e0b478',
+      mesa: '#a87c4e', mesaTop: '#c99a63',
+      ruin: '#b09a78', ruinTop: '#8f7c5e',
+      tent: '#c2a97e', tentDark: '#8a7454',
+      palmLeaf: '#3f5a35', palmLeaf2: '#4d6b3f'
+    },
+    /* 石灯笼：白天地图里"不点灯"，于是只改这几个色，几何一律不动 */
+    lamp: {
+      pole: '#1f2835', body: '#2b3546', core: '#ffc061',
+      glow: ['rgba(255,166,72,0.55)', 'rgba(255,138,48,0.16)', 'rgba(255,140,60,0)'],
+      light: ['rgba(255,154,52,0.62)', 'rgba(255,124,28,0.22)', 'rgba(255,110,20,0)'],
+      poolA: 0.34
+    },
+    /* 萤火：三个 rgb 三元组，alpha 由代码现算后拼进 rgba(...) */
+    fly: { a: '255,232,160', b: '205,255,175', c: '180,255,160' },
+    shadow: 0.42      // 妖物/人物脚下影子的不透明度
+  };
+
+  /* 深合并（两层足够）。地图只覆盖个别色值，
+   * 用"整块替换"的话，BASE_THEME 里将来新增的字段在被覆盖的地图上会变成 undefined ——
+   * 那种崩溃只在切到那张地图时出现，最难查。 */
+  function deepMerge(base, over) {
+    var out = {}, k;
+    for (k in base) if (Object.prototype.hasOwnProperty.call(base, k)) out[k] = base[k];
+    for (k in over) if (Object.prototype.hasOwnProperty.call(over, k)) {
+      var b = out[k], o = over[k];
+      if (b && o && typeof b === 'object' && typeof o === 'object' &&
+          !Array.isArray(b) && !Array.isArray(o)) {
+        var m = {}, k2;
+        for (k2 in b) if (Object.prototype.hasOwnProperty.call(b, k2)) m[k2] = b[k2];
+        for (k2 in o) if (Object.prototype.hasOwnProperty.call(o, k2)) m[k2] = o[k2];
+        out[k] = m;
+      } else out[k] = o;
+    }
+    return out;
+  }
+
+  /* ── 地图（场景） ──
+   * kinds = 三条景物带上各摆什么，按 SCENE.belts 的顺序一一对应。
+   * 只写种类、不写坐标：位置仍由「世界里程 + 稳定哈希」推导（见 SCENE 注释），
+   * 所以换地图不会让世界"重掷"，只是换了同一批槽位上长什么东西。
+   *
+   * price 的依据（dev/economy.js 实测，别凭感觉调）。一局到手多少分三档：
+   *   最快 —— 会躲（233ms 反应）且通关：掉落 521 + 通关奖励 120 = 641/局
+   *   只会躲、没通关：521/局      不擅走位：227 + 120 = 347/局
+   * 定价**按最快那一档**折算，因为"连最顺的人都要打这么多局，慢的只会更久"：
+   *   day ≈ 10.3 局、desert ≈ 13.7 局 —— 对上"地图 10 多局往上"；
+   *   同一组价格对不擅走位的人是 19.0 / 25.4 局，属于"值得攒一阵"的那一档。
+   * ⚠ dev/e2e-test.js 测试 L 会把最快基线钉成断言，改价先跑 economy.js。
+   * ⚠ 口径坑：G.coins 里混着通关奖励（endGame 在置 result 之前就加了），
+   *   economy.js 已经把这笔单独扣出来报，别把"到手"当成"掉落"用。 */
+  var MAPS = [
+    {
+      key: 'night', name: '暮色长路', sub: '夜色 · 灯笼', price: 0,
+      desc: '初入江湖的那条夜路。石灯笼一路点到天边。',
+      kinds: null                     // null = 用 SCENE 里的默认种类
+    },
+    {
+      key: 'day', name: '白昼长路', sub: '晴天 · 山径', price: 6600,
+      desc: '同一条路，白天。远山、竹影、屋顶的瓦都看得清了。',
+      kinds: [['grass', 'rock', 'bamboo', 'grass', 'banner', 'rock', 'bush'],
+              ['pine', 'broadleaf', 'pine', 'rock', 'hut', 'broadleaf'],
+              ['pine', 'pagoda', 'gate', 'broadleaf', 'pine']],
+      over: {
+        sky: ['#3f7fc4', '#6ea8dd', '#9cc6e9', '#c8dcee'],
+        ground: ['#8aa260', '#6d854c', '#4b5f36'],
+        ridge: ['#93aec2', '#7e9aae'],
+        treeLine: ['#5b7a44', '#4a6636'],
+        haze: ['rgba(255,255,255,0)', 'rgba(255,255,255,0.10)',
+               'rgba(255,255,255,0.22)', 'rgba(255,255,255,0)'],
+        road: ['#8f8a80', '#7b766c', '#66625a'],
+        stripe: '255,255,255',
+        dash: 'rgba(255,255,255,0.50)',
+        curb: '236,238,242',
+        curbA: 0.42,
+        curbGlowA: 0.06,
+        verge: '#6f6a60',
+        fogMin: 0.34,
+        fogD: 95,
+        vig: 0.22,
+        flies: 0,
+        P: {
+          grass: '#4e6b32', bush: '#41602c', bushTop: '#4f7034',
+          rock: '#7b7a72', rockTop: '#8f8e85',
+          trunk: '#4a3d30', pineA: '#39562f', pineB: '#2f4a28',
+          leafA: '#3f5f2e', leafB: '#4d7137', edge: 'rgba(255,255,240,0.38)',
+          stalkA: '#5b7a3a', stalkB: '#6a8c45', leafC: '#7fae55',
+          pole: '#5a5048', cloth: '#b8443c', emblem: 'rgba(255,255,255,0.55)',
+          wall: '#c3b6a1', roof: '#6b4b3a', window: 'rgba(52,44,38,0.55)',
+          eave: 'rgba(0,0,0,0.18)', stone: '#8a8578', tower: '#a8a196'
+        },
+        lamp: {
+          pole: '#8a8578', body: '#9b9689', core: '#cfcabc',
+          glow: ['rgba(255,255,255,0)', 'rgba(255,255,255,0)', 'rgba(255,255,255,0)'],
+          light: ['rgba(255,255,255,0)', 'rgba(255,255,255,0)', 'rgba(255,255,255,0)'],
+          poolA: 0
+        },
+        shadow: 0.30
+      }
+    },
+    {
+      key: 'desert', name: '大漠孤烟', sub: '黄昏 · 沙丘', price: 8800,
+      desc: '落日把沙丘压成剪影。仙人掌、断柱、商队的帐篷。',
+      kinds: [['grass', 'rock', 'cactus', 'rock', 'banner', 'dune', 'grass'],
+              ['cactus', 'dune', 'palm', 'ruin', 'tent', 'rock'],
+              ['palm', 'ruin', 'obelisk', 'mesa', 'cactus']],
+      over: {
+        sky: ['#33406f', '#8a5a80', '#d4795a', '#f0b070'],
+        ground: ['#c08a52', '#a8703f', '#6b4526'],
+        ridge: ['#7a4f52', '#5a3a42'],
+        treeLine: ['#4a2f34', '#3a252a'],
+        haze: ['rgba(255,190,120,0)', 'rgba(255,180,110,0.10)',
+               'rgba(255,170,100,0.24)', 'rgba(255,160,90,0)'],
+        road: ['#8a7358', '#75604a', '#5f4d3c'],
+        stripe: '255,220,170',
+        dash: 'rgba(255,232,190,0.34)',
+        curb: '255,208,150',
+        curbA: 0.48,
+        curbGlowA: 0.10,
+        verge: '#6d543a',
+        fogMin: 0.34,
+        fogD: 58,
+        vig: 0.40,
+        flies: 9,
+        P: {
+          grass: '#8a7340', bush: '#6b6a34', bushTop: '#7a7a3d',
+          rock: '#8a7355', rockTop: '#9c8465',
+          trunk: '#4a3524', pineA: '#5a4a30', pineB: '#4a3c26',
+          leafA: '#3f5a35', leafB: '#4d6b3f', edge: 'rgba(255,224,170,0.30)',
+          stalkA: '#3d6b45', stalkB: '#4a7a50', leafC: '#5a8a5c',
+          pole: '#5a4330', cloth: '#a8483a', emblem: 'rgba(255,235,190,0.5)',
+          wall: '#b09a78', roof: '#8a7050', window: 'rgba(255,200,120,0.60)',
+          eave: 'rgba(0,0,0,0.30)', stone: '#8f7c5e', tower: '#a08a68'
+        },
+        lamp: {
+          pole: '#6b5238', body: '#7d6244', core: '#ffd07a',
+          glow: ['rgba(255,196,110,0.50)', 'rgba(255,170,80,0.16)', 'rgba(255,160,70,0)'],
+          light: ['rgba(255,182,96,0.58)', 'rgba(255,158,70,0.20)', 'rgba(255,150,60,0)'],
+          poolA: 0.30
+        },
+        fly: { a: '255,220,150', b: '255,196,120', c: '255,180,110' },
+        shadow: 0.34
+      }
+    }
+  ];
+
+  /* ── 皮肤 ──
+   * 一套皮肤 = 一套**配色** + 一份**体型参数**，男款女款共用配色、只换体型与发型。
+   * 这正是用户要的"性别切换但皮肤不变"：切的是 male/female 这两组参数，
+   * 不是换一套皮肤。
+   *
+   * 体型参数的含义（都以"初始男款"为 1.0，所以那个组合画出来必须与改动前逐像素一致）：
+   *   shK  肩宽倍率 —— 乘在现画法里的 wPx * 0.3 上
+   *   hipK 下摆倍率 —— 乘在现画法里的 wPx * 0.52 上
+   *   hair 发型：short / bun / long / ponytail / bald
+   *   skirt 裙摆外张（0 = 直筒，越大越像裙子），只画在腰线以下
+   * gear 是头饰（盔缨 / 头巾 / 斗笠 / 角盔 / 条纹头巾 / 发带），null 就是没有。
+   * weapon 是手上那把家伙：剑 / 长枪 / 弯刀 / 太刀 / 战斧 / 权杖 / 弓。
+   *
+   * price 依据同 MAPS（同一份 dev/economy.js 基线）。按最快档 641/局折算，
+   * 皮肤落在 1.4~3.7 局之间 —— 比地图便宜一大档，玩家能更早拿到第一件东西
+   * （有反馈才有继续玩的动力）；对不擅走位的人是 2.6~6.9 局。 */
+  var SKINS = [
+    {
+      key: 'wuxia', name: '青衫剑客', nation: '中原', job: '剑客', price: 0,
+      desc: '一袭青衫，负剑独行。',
+      body: { robe: ['#a8cfff', '#3d6cd4'], trim: '#e9f4ff', belt: '#2b4a8f', boot: '#1d2740', cape: null },
+      head: { skin: '#ffe2bd', hair: '#232838' },
+      gear: null,
+      weapon: { kind: 'sword', color: '#d6ecff' },
+      male: { shK: 1.00, hipK: 1.00, hair: 'bun', skirt: 0.06 },
+      female: { shK: 0.86, hipK: 1.14, hair: 'long', skirt: 0.46 }
+    },
+    {
+      key: 'greek', name: '斯巴达重装', nation: '希腊', job: '重装枪兵', price: 900,
+      desc: '青铜胸甲，赤缨长枪。',
+      body: { robe: ['#dfe8f2', '#8fa3b8'], trim: '#c8a447', belt: '#7a5f22', boot: '#4a3a24', cape: '#9c3537' },
+      head: { skin: '#ecc79c', hair: '#3a2a1e' },
+      gear: { kind: 'plume', color: '#c0392b' },
+      weapon: { kind: 'spear', color: '#e6d6a8' },
+      male: { shK: 1.16, hipK: 0.98, hair: 'short', skirt: 0.16 },
+      female: { shK: 0.98, hipK: 1.16, hair: 'ponytail', skirt: 0.56 }
+    },
+    {
+      key: 'persian', name: '波斯刺客', nation: '波斯', job: '刺客', price: 1200,
+      desc: '缠头遮面，弯刀出袖。',
+      body: { robe: ['#7d5a9c', '#3d2a52'], trim: '#e0b552', belt: '#8a6a20', boot: '#2b2233', cape: '#5b3f74' },
+      head: { skin: '#e3bd92', hair: '#221a20' },
+      gear: { kind: 'turban', color: '#d8c58a' },
+      weapon: { kind: 'scimitar', color: '#f0e2b0' },
+      male: { shK: 1.02, hipK: 0.98, hair: 'short', skirt: 0.20 },
+      female: { shK: 0.88, hipK: 1.12, hair: 'long', skirt: 0.52 }
+    },
+    {
+      key: 'ronin', name: '东瀛浪人', nation: '东瀛', job: '浪人', price: 1500,
+      desc: '斗笠压低，太刀在腰。',
+      body: { robe: ['#5c6b7a', '#2b3542'], trim: '#9fb0c0', belt: '#7a5a34', boot: '#23292f', cape: null },
+      head: { skin: '#e8c49c', hair: '#1c1d22' },
+      gear: { kind: 'kasa', color: '#a08a54' },
+      weapon: { kind: 'katana', color: '#eaf4ff' },
+      male: { shK: 1.04, hipK: 0.94, hair: 'bun', skirt: 0.14 },
+      female: { shK: 0.90, hipK: 1.08, hair: 'ponytail', skirt: 0.44 }
+    },
+    {
+      key: 'viking', name: '北境狂战', nation: '北欧', job: '狂战士', price: 1800,
+      desc: '皮甲兽肩，双刃战斧。',
+      body: { robe: ['#8a6b4a', '#4a3626'], trim: '#c9c2b4', belt: '#5c4326', boot: '#33251a', cape: '#6b4a3a' },
+      head: { skin: '#f0cda6', hair: '#c98a3c' },
+      gear: { kind: 'horn', color: '#cfd6de' },
+      weapon: { kind: 'axe', color: '#b9c4cf' },
+      male: { shK: 1.20, hipK: 1.04, hair: 'long', skirt: 0.18 },
+      female: { shK: 1.00, hipK: 1.18, hair: 'ponytail', skirt: 0.50 }
+    },
+    {
+      key: 'egypt', name: '尼罗河祭司', nation: '埃及', job: '祭司', price: 2100,
+      desc: '亚麻白袍，金项圈与蛇杖。',
+      body: { robe: ['#f2ece0', '#c9bba0'], trim: '#d8b03c', belt: '#b8932c', boot: '#8a7a58', cape: null },
+      head: { skin: '#d9a970', hair: '#1a1a1a' },
+      gear: { kind: 'nemes', color: '#2f5fa8' },
+      weapon: { kind: 'staff', color: '#e8d07a' },
+      male: { shK: 1.02, hipK: 1.00, hair: 'bald', skirt: 0.24 },
+      female: { shK: 0.90, hipK: 1.12, hair: 'long', skirt: 0.54 }
+    },
+    {
+      key: 'archer', name: '草原神射', nation: '草原', job: '弓手', price: 2400,
+      desc: '皮袍窄袖，反曲弓在手。',
+      body: { robe: ['#b8763c', '#6b3a1e'], trim: '#f0d9a8', belt: '#4a2a14', boot: '#33200f', cape: '#8f5a2a' },
+      head: { skin: '#e0b184', hair: '#2a1c14' },
+      gear: { kind: 'band', color: '#c8a447' },
+      weapon: { kind: 'bow', color: '#c9a86a' },
+      male: { shK: 1.08, hipK: 0.96, hair: 'short', skirt: 0.20 },
+      female: { shK: 0.92, hipK: 1.10, hair: 'ponytail', skirt: 0.48 }
+    }
+  ];
+
+  MAPS.forEach(function (m) { m.th = deepMerge(BASE_THEME, m.over || {}); });
+
+  function mapOf(key) {
+    for (var i = 0; i < MAPS.length; i++) if (MAPS[i].key === key) return MAPS[i];
+    return MAPS[0];
+  }
+  function skinOf(key) {
+    for (var i = 0; i < SKINS.length; i++) if (SKINS[i].key === key) return SKINS[i];
+    return SKINS[0];
+  }
+
+  /* 预览用的临时主题覆盖：商城里同时要画好几张地图的缩略图，
+   * 而绘制代码读的是"当前装备的那张"。用这个变量临时改指向，
+   * 画完立刻还原（withTarget 里成对做，见 renderMapThumb）。 */
+  var themeKey = null;
+  function theme() { return mapOf(themeKey || profile.map).th; }
+
+  /* 某张地图实际生效的景物带（只换 kinds，位置逻辑一律不动）。 */
+  function beltsFor(key) {
+    var m = mapOf(key);
+    if (!m.kinds) return SCENE.belts;
+    return SCENE.belts.map(function (b, i) {
+      var ks = m.kinds[i];
+      if (!ks) return b;
+      var c = {};
+      for (var k in b) if (Object.prototype.hasOwnProperty.call(b, k)) c[k] = b[k];
+      c.kinds = ks;
+      return c;
+    });
+  }
+
+  /* ══════════════════ 存档（金币 / 已购 / 装备 / 性别） ══════════════════
+   * 用一个键装完，避免"改了五个键、漏存其中一个"这种存档撕裂。
+   * ⚠ 读进来必须**逐字段校验**：localStorage 里的东西可能是上一版写的、
+   *   也可能被用户手改过。一个不存在的 skin key 会让绘制直接抛异常，
+   *   症状是"打开就白屏"，而且清缓存才好 —— 校验比"相信存档"便宜太多。 */
+  var PROFILE_KEY = 'rd_profile';
+  var profile = {
+    coins: 0,          // 当前余额
+    earned: 0,         // 累计挣到的（结算页/统计用；不改价也能看出玩家玩了多久）
+    runs: 0,           // 完成的局数
+    ownedMaps: ['night'],
+    ownedSkins: ['wuxia'],
+    map: 'night',
+    skin: 'wuxia',
+    gender: 'male'
+  };
+
+  function hasKeyIn(list, arr) {
+    for (var i = 0; i < list.length; i++) if (list[i].key === arr) return true;
+    return false;
+  }
+  function uniq(list, table) {
+    var out = [];
+    (list || []).forEach(function (k) {
+      if (typeof k !== 'string') return;
+      if (!hasKeyIn(table, k)) return;              // 不认识的一律丢掉
+      if (out.indexOf(k) < 0) out.push(k);
+    });
+    return out;
+  }
+
+  (function loadProfile() {
+    var raw = null;
+    try { raw = JSON.parse(localStorage.getItem(PROFILE_KEY) || 'null'); } catch (e) { raw = null; }
+    if (!raw || typeof raw !== 'object') return;
+    if (typeof raw.coins === 'number' && isFinite(raw.coins)) profile.coins = Math.max(0, Math.floor(raw.coins));
+    if (typeof raw.earned === 'number' && isFinite(raw.earned)) profile.earned = Math.max(0, Math.floor(raw.earned));
+    if (typeof raw.runs === 'number' && isFinite(raw.runs)) profile.runs = Math.max(0, Math.floor(raw.runs));
+    profile.ownedMaps = uniq(raw.ownedMaps, MAPS);
+    profile.ownedSkins = uniq(raw.ownedSkins, SKINS);
+    /* 初始项永远算已拥有 —— 存档损坏/被清空也不能把玩家锁在"没有地图可用"的状态里 */
+    if (profile.ownedMaps.indexOf('night') < 0) profile.ownedMaps.unshift('night');
+    if (profile.ownedSkins.indexOf('wuxia') < 0) profile.ownedSkins.unshift('wuxia');
+    profile.map = profile.ownedMaps.indexOf(raw.map) >= 0 ? raw.map : 'night';
+    profile.skin = profile.ownedSkins.indexOf(raw.skin) >= 0 ? raw.skin : 'wuxia';
+    profile.gender = (raw.gender === 'female') ? 'female' : 'male';
+  })();
+
+  function saveProfile() {
+    try { localStorage.setItem(PROFILE_KEY, JSON.stringify(profile)); } catch (e) {}
+  }
+
+  function ownsMap(key) { return profile.ownedMaps.indexOf(key) >= 0; }
+  function ownsSkin(key) { return profile.ownedSkins.indexOf(key) >= 0; }
+  function owns(kind, key) { return kind === 'map' ? ownsMap(key) : ownsSkin(key); }
+
+  /* 买。返回 {ok, reason}：调用方要能区分"钱不够"和"已经买过"，
+   * 否则只能给一句笼统的失败提示。 */
+  function buy(kind, key) {
+    var d = kind === 'map' ? mapOf(key) : skinOf(key);
+    if (owns(kind, key)) return { ok: false, reason: 'owned' };
+    if (profile.coins < d.price) return { ok: false, reason: 'poor', need: d.price - profile.coins };
+    profile.coins -= d.price;
+    (kind === 'map' ? profile.ownedMaps : profile.ownedSkins).push(key);
+    /* 买完直接装备 —— 买了个东西却要再点一下"使用"，是没必要的第二刀 */
+    if (kind === 'map') profile.map = key; else profile.skin = key;
+    saveProfile();
+    return { ok: true, item: d };
+  }
+
+  function equip(kind, key) {
+    if (!owns(kind, key)) return false;
+    if (kind === 'map') profile.map = key; else profile.skin = key;
+    saveProfile();
+    return true;
+  }
+
+  function setGender(g) {
+    profile.gender = (g === 'female') ? 'female' : 'male';
+    saveProfile();
+    return profile.gender;
+  }
+
   /* ══════════════════ 音效（Web Audio 合成，无外部资源） ══════════════════ */
   var Sound = {
     ctx: null, master: null,
@@ -332,9 +748,16 @@
     canvas.height = Math.round(H * DPR);
     ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
     buildRoad();
+    buildVignette();
+  }
+
+  /* 暗角。强度走主题：夜景要 0.55 才压得住远处的亮块，
+   * 白天/沙漠用同样的 0.55 会像被熏黑了 —— 所以它是"每张地图的参数"，
+   * 不是全局常量。换地图时要重建（渐变对象是缓存下来的，不重建就还是旧强度）。 */
+  function buildVignette() {
     vignette = ctx.createRadialGradient(W * 0.5, H * 0.55, H * 0.25, W * 0.5, H * 0.55, H * 0.95);
     vignette.addColorStop(0, 'rgba(0,0,0,0)');
-    vignette.addColorStop(1, 'rgba(0,0,0,0.55)');
+    vignette.addColorStop(1, 'rgba(0,0,0,' + theme().vig + ')');
   }
 
   function buildRoad() {
@@ -360,6 +783,9 @@
   function newGame() {
     G = {
       t: 0, score: 0, kills: 0,
+      /* coins = 本局已挣到的金币（结算时入账）；coinGain = 有过几次进账，
+       * 给 HUD 的"跳一下"动画用 —— 光比大小的话，同一帧连捡两只就只跳一次。 */
+      coins: 0, coinGain: 0, banked: false,
       hp: CFG.maxHp, maxHp: CFG.maxHp,
       x3d: 0, vx: 0,
       scroll: 0,
@@ -866,7 +1292,12 @@
     m.dead = true;
     G.kills++;
     G.score += m.type.score;
-    G.floats.push({ x: m.x3d, y: m.y3d, text: '+' + m.type.score, color: '#ffe08a', life: 0.95 });
+    /* 两种浮字故意分开一点：积分往上一点（更远处，屏幕上更高），金币留在原处。
+     * 两个都从同一位置起跳的话，妖物密集时数字会叠在一起看不清。 */
+    G.floats.push({ x: m.x3d, y: m.y3d + 2.0, text: '+' + m.type.score, color: '#ffe08a', life: 0.95 });
+    G.coins += m.type.coin;
+    G.coinGain++;
+    G.floats.push({ x: m.x3d, y: m.y3d, text: '+' + m.type.coin, color: '#ffd166', life: 0.95, coin: true });
     burstAt(m.x3d, m.y3d, 16, m.type.color);
     Sound.kill();
     vibrate(14);
@@ -1007,16 +1438,18 @@
   }
 
   function drawSky() {
+    var th = theme();
     var g = ctx.createLinearGradient(0, 0, 0, H);
-    g.addColorStop(0, '#080d18');
-    g.addColorStop(0.38, '#121a2a');
-    g.addColorStop(0.60, '#1a2130');
-    g.addColorStop(1, '#0c1017');
+    g.addColorStop(0, th.sky[0]);
+    g.addColorStop(0.38, th.sky[1]);
+    g.addColorStop(0.60, th.sky[2]);
+    g.addColorStop(1, th.sky[3]);
     ctx.fillStyle = g;
     ctx.fillRect(0, 0, W, H);
   }
 
   function drawRoad() {
+    var th = theme();
     var far = road.crossSectionAtT(0.995);
     var scroll = currentScroll();
 
@@ -1028,9 +1461,9 @@
     ctx.lineTo(road.right0.x, road.right0.y);
     ctx.closePath();
     var rg = ctx.createLinearGradient(0, road.left0.y, 0, far.a.y);
-    rg.addColorStop(0, '#2c313d');
-    rg.addColorStop(0.42, '#232833');
-    rg.addColorStop(1, '#1a1e28');
+    rg.addColorStop(0, th.road[0]);
+    rg.addColorStop(0.42, th.road[1]);
+    rg.addColorStop(1, th.road[2]);
     ctx.fillStyle = rg;
     ctx.fill();
 
@@ -1042,7 +1475,7 @@
       var cs = road.crossSectionAtDepth(y);
       var a = 0.085 * (1 - road.tFromDepth(y));
       if (a < 0.004) continue;
-      ctx.strokeStyle = 'rgba(160,190,240,' + a.toFixed(3) + ')';
+      ctx.strokeStyle = 'rgba(' + th.stripe + ',' + a.toFixed(3) + ')';
       ctx.beginPath();
       ctx.moveTo(cs.a.x, cs.a.y);
       ctx.lineTo(cs.b.x, cs.b.y);
@@ -1052,7 +1485,7 @@
     // 三条小路的分隔虚线（x = ±roadWidth/6）
     var dashPeriod = 6, dashLen = 3.1;
     var off2 = scroll % dashPeriod;
-    ctx.strokeStyle = 'rgba(200,222,255,0.24)';
+    ctx.strokeStyle = th.dash;
     ctx.lineWidth = 2.2;
     var bounds = [-CFG.roadWidth / 6, CFG.roadWidth / 6];
     for (var k = 0; k < bounds.length; k++) {
@@ -1102,17 +1535,19 @@
     wM: 0.048,      // 路沿宽度（米）—— 4.8 厘米，现实里一条路缘石的量级
     glowK: 2.67,    // 辉光宽度 = 实边 × 该倍率（即改动前的 8px ÷ 3px）
     minW: 0.45,     // 细于此就不再绘制（亚像素只会糊成灰线）
-    aNear: 0.55,    // 近端不透明度
-    glowA: 0.16,    // 辉光不透明度
     fogD: 110,      // 空气透视特征距离（米）
     segs: 36
   };
+  /* 颜色与不透明度走地图主题（夜/昼/沙漠的路沿不该是同一个色、同一个亮度）；
+   * 宽度、分段数、衰减距离走上面这张几何表 —— 它们跟光照无关，跨地图不该变。
+   * 近端不透明度：夜 0.55（与抽主题前完全一致，测试 J 钉着这个数），白天更淡。 */
 
   /* 路沿几何：枚举与绘制分离（和 sceneItems 一个路子）。
    * 自动化测试可以直接拿到每段的宽度/透明度来断言比值恒定，
    * 不必去解码像素、也不必去数 stroke 调用次数。
    * 返回每段：{ a0,a1,b0,b1（左右两条边的起止点）, w, roadW, alpha, depth } */
   function curbSegments() {
+    var th = theme();
     var out = [];
     var tEnd = 0.995;                      // 与路面主体的远端一致，长度不会对不上
     for (var i = 0; i < CURB.segs; i++) {
@@ -1129,7 +1564,7 @@
       out.push({
         a0: c0.a, a1: c1.a, b0: c0.b, b1: c1.b,
         w: w, roadW: (c0.width + c1.width) / 2,
-        alpha: CURB.aNear * Math.exp(-depth / CURB.fogD),
+        alpha: th.curbA * Math.exp(-depth / CURB.fogD),
         depth: depth
       });
     }
@@ -1138,21 +1573,28 @@
 
   /* 辉光层的宽度与不透明度都从主层按比例推出 ——
    * 上一版辉光是写死的 8px，远端比主线（3px）还宽，
-   * 等于给「远处路沿又粗又亮」又加了一层。两处写死必然走样，这里只写一处。 */
-  var CURB_LAYERS = [
-    { k: 1, ak: 1 },                          // 实边
-    { k: CURB.glowK, ak: CURB.glowA / CURB.aNear }   // 辉光
-  ];
+   * 等于给「远处路沿又粗又亮」又加了一层。两处写死必然走样，这里只写一处。
+   * 比例在每次绘制时现算：换地图会同时改 curbA 与 curbGlowA，
+   * 提前算好常量的话，切到白天就成了"用夜景的比例画白天的辉光"。 */
+  function curbLayers() {
+    var th = theme();
+    return [
+      { k: 1, ak: 1 },                                      // 实边
+      { k: CURB.glowK, ak: th.curbGlowA / th.curbA }        // 辉光
+    ];
+  }
 
   function drawCurb() {
+    var th = theme();
     var segs = curbSegments();
-    for (var L = 0; L < CURB_LAYERS.length; L++) {
-      var k = CURB_LAYERS[L].k, ak = CURB_LAYERS[L].ak;
+    var layers = curbLayers();
+    for (var L = 0; L < layers.length; L++) {
+      var k = layers[L].k, ak = layers[L].ak;
       for (var i = 0; i < segs.length; i++) {
         var s = segs[i];
         var a = s.alpha * ak;
         if (a < 0.004) continue;              // 已经淡到看不见，别再花一次 stroke
-        ctx.strokeStyle = 'rgba(120,190,255,' + a.toFixed(3) + ')';
+        ctx.strokeStyle = 'rgba(' + th.curb + ',' + a.toFixed(3) + ')';
         ctx.lineWidth = s.w * k;
         ctx.beginPath();
         ctx.moveTo(s.a0.x, s.a0.y); ctx.lineTo(s.a1.x, s.a1.y);
@@ -1173,37 +1615,38 @@
   /* 天地底子：铺地 + 远山剪影 + 地平线雾带。画在路面之下，永远只是背景。 */
   function drawBackdrop() {
     if (!road) return;
+    var th = theme();
     var hy = road.vanish.y;          // 地平线 = 路面消失点所在高度
     var scroll = currentScroll();
 
     // ① 铺地：地平线以下全部填成"地"。近处压暗、远处提亮 ——
     //    反过来做（近亮远暗）会立刻失去纵深。
     var gg = ctx.createLinearGradient(0, hy, 0, H);
-    gg.addColorStop(0, '#1a2333');
-    gg.addColorStop(0.30, '#131a26');
-    gg.addColorStop(1, '#0e131c');
+    gg.addColorStop(0, th.ground[0]);
+    gg.addColorStop(0.30, th.ground[1]);
+    gg.addColorStop(1, th.ground[2]);
     ctx.fillStyle = gg;
     ctx.fillRect(0, hy, W, H - hy);
 
     // ② 远山：两层剪影，远层淡、近层深，靠视差速度把两层分开
-    drawRidge(hy - 2, 46, 0.30, '#131c29', scroll, 0.6);
-    drawRidge(hy + 5, 26, 1.05, '#0c131c', scroll, 2.1);
+    drawRidge(hy - 2, 46, 0.30, th.ridge[0], scroll, 0.6);
+    drawRidge(hy + 5, 26, 1.05, th.ridge[1], scroll, 2.1);
 
     // ②b 远树线：高频小振幅 → 锯齿状树冠剪影。
     //     专门填"地平线到中景"那条带 —— 那条带对应 200 米开外，
     //     靠 belt 铺过去要几百个物件，用一条程序化锯齿几乎不花钱。
-    drawTreeLine(hy + 16, 12, 2.4, '#141d2b', scroll);
-    drawTreeLine(hy + 24, 7, 3.4, '#111927', scroll);
+    drawTreeLine(hy + 16, 12, 2.4, th.treeLine[0], scroll);
+    drawTreeLine(hy + 24, 7, 3.4, th.treeLine[1], scroll);
 
     // ③ 地平线雾带：把天与地接起来，同时给远景一层空气。
     //    必须向上向下都渐隐到 0 —— 只在一端收边的话，屏幕上会出现一道横向硬边，
     //    非常显眼（第一版就踩了这个坑）。
     var top = hy - H * 0.20, bot = hy + H * 0.12;
     var hz = ctx.createLinearGradient(0, top, 0, bot);
-    hz.addColorStop(0, 'rgba(110,150,205,0)');
-    hz.addColorStop(0.50, 'rgba(104,144,200,0.055)');
-    hz.addColorStop(0.625, 'rgba(150,185,232,0.125)');   // 0.625 ≈ 地平线所在位置
-    hz.addColorStop(1, 'rgba(120,160,215,0)');
+    hz.addColorStop(0, th.haze[0]);
+    hz.addColorStop(0.50, th.haze[1]);
+    hz.addColorStop(0.625, th.haze[2]);   // 0.625 ≈ 地平线所在位置
+    hz.addColorStop(1, th.haze[3]);
     ctx.fillStyle = hz;
     ctx.fillRect(0, Math.max(0, top), W, bot - Math.max(0, top));
   }
@@ -1249,6 +1692,7 @@
    * 没有它，路面像浮在虚空里的一个楔子；有了它，"路是修在地面上的"才成立。 */
   function drawVerge() {
     var dx = 0.9;
+    ctx.fillStyle = theme().verge;
     for (var side = -1; side <= 1; side += 2) {
       var i0 = road.project(side * CFG.roadWidth / 2, 0).pos;
       var iF = road.project(side * CFG.roadWidth / 2, 168).pos;
@@ -1260,17 +1704,22 @@
       ctx.lineTo(oF.x, oF.y);
       ctx.lineTo(o0.x, o0.y);
       ctx.closePath();
-      ctx.fillStyle = '#141a24';
       ctx.fill();
     }
   }
 
   /* 把"当前视野里有哪些景物"单独拆出来。
    * drawScenery 只负责画，枚举逻辑不碰 canvas —— 自动化测试于是可以直接清点
-   * （数量、横向位置、雾值），不必去解码像素。 */
-  function sceneItems(scroll, emit) {
-    for (var row = 0; row < SCENE.belts.length; row++) {
-      var b = SCENE.belts[row];
+   * （数量、横向位置、雾值），不必去解码像素。
+   *
+   * mapKey 可选：传了就按那张地图的景物种类与雾参数枚举。
+   * 商城要给三张地图各画一张缩略图，测试要校验"每张地图都不许把物件怼到路面上"，
+   * 两者都需要"按地图枚举"，而不是只能枚举当前装备的那张。 */
+  function sceneItems(scroll, emit, mapKey) {
+    var th = mapOf(mapKey || profile.map).th;
+    var belts = beltsFor(mapKey || profile.map);
+    for (var row = 0; row < belts.length; row++) {
+      var b = belts[row];
       var lo = Math.ceil((scroll + 1.2) / b.spacing);
       var hi = Math.floor((scroll + b.maxDepth) / b.spacing);
       if (hi < lo) continue;
@@ -1283,7 +1732,7 @@
           var x3d = side * (b.minX + r() * b.spread);
           var q = road.project(x3d, y3d);
           if (q.scale < 0.03) continue;
-          var alpha = SCENE.fogMin + (1 - SCENE.fogMin) * Math.exp(-y3d / SCENE.fogD);
+          var alpha = th.fogMin + (1 - th.fogMin) * Math.exp(-y3d / th.fogD);
           var kind = b.kinds[Math.floor(r() * b.kinds.length)];
           if (emit(kind, x3d, y3d, q, alpha, r, row, k, side) === false) return;
         }
@@ -1308,8 +1757,11 @@
   }
 
   /* 石灯笼：等距、左右交替 —— 规律的韵律会极大强化"路在无限延伸"的感觉，
-   * 也是整幅夜景里唯一的暖色，冷blue调里必须有点暖的当锚点。 */
+   * 也是整幅夜景里唯一的暖色，冷blue调里必须有点暖的当锚点。
+   * 白天的地图里它只是"没点灯的石头灯笼"：几何一行没改，只把
+   * 灯芯/辉光/光池的色值换成了全透明（见 BASE_THEME.lamp）。 */
   function drawLanterns(scroll) {
+    var th = theme();
     var sp = SCENE.lampSpacing;
     var lo = Math.ceil((scroll + 1.5) / sp), hi = Math.floor((scroll + 300) / sp);
     for (var k = lo; k <= hi; k++) {
@@ -1321,26 +1773,27 @@
         if (q.pos.x < -140 || q.pos.x > W + 140) continue;
         /* 灯光比景物"穿雾"：衰减更慢，远处的灯要还看得见 */
         propLantern(q.pos.x, q.pos.y, pxPerMeter * q.scale,
-          Math.max(0.24, SCENE.fogMin + (1 - SCENE.fogMin) * Math.exp(-y3d / (SCENE.fogD * 2.2))));
+          Math.max(0.24, th.fogMin + (1 - th.fogMin) * Math.exp(-y3d / (th.fogD * 2.2))), th);
       }
     }
   }
 
-  function propLantern(bx, by, u, a) {
+  function propLantern(bx, by, u, a, th) {
     var h = 2.15 * u, w = h * 0.30;
 
     /* 地面光池：叠加混合，会顺带照亮路面 —— 冷暖对比的关键。
      * u < 7 说明这盏灯在 200 米开外，光池已经小到看不见了，
-     * 直接跳过：那是纯浪费的逐像素填充（DPR 2 下占了装饰开销的大头）。 */
-    if (u >= 7) {
+     * 直接跳过：那是纯浪费的逐像素填充（DPR 2 下占了装饰开销的大头）。
+     * 白天 poolA = 0，这一整段直接不执行 —— 顺手也省掉了白天最大的那笔填充。 */
+    if (u >= 7 && th.lamp.poolA > 0) {
       ctx.save();
       ctx.globalCompositeOperation = 'lighter';
-      ctx.globalAlpha = 0.34 * a;
+      ctx.globalAlpha = th.lamp.poolA * a;
       var rr = u * 1.5;
       var g = ctx.createRadialGradient(bx, by, 0, bx, by, rr);
-      g.addColorStop(0, 'rgba(255,166,72,0.55)');
-      g.addColorStop(0.45, 'rgba(255,138,48,0.16)');
-      g.addColorStop(1, 'rgba(255,140,60,0)');
+      g.addColorStop(0, th.lamp.glow[0]);
+      g.addColorStop(0.45, th.lamp.glow[1]);
+      g.addColorStop(1, th.lamp.glow[2]);
       ctx.fillStyle = g;
       ctx.beginPath();
       ctx.ellipse(bx, by, rr, rr * 0.40, 0, 0, 6.283);
@@ -1350,10 +1803,10 @@
 
     // 灯身
     ctx.globalAlpha = a;
-    ctx.fillStyle = '#1f2835';
+    ctx.fillStyle = th.lamp.pole;
     ctx.fillRect(bx - u * 0.05, by - h * 0.30, u * 0.10, h * 0.30);
     ctx.fillRect(bx - u * 0.15, by - h * 0.02, u * 0.30, h * 0.05);
-    ctx.fillStyle = '#2b3546';
+    ctx.fillStyle = th.lamp.body;
     ctx.beginPath();
     ctx.moveTo(bx - w * 0.5, by - h * 0.68);
     ctx.lineTo(bx + w * 0.5, by - h * 0.68);
@@ -1376,26 +1829,30 @@
     ctx.globalAlpha = a;
     var ly = by - h * 0.55;
     var lg = ctx.createRadialGradient(bx, ly, 0, bx, ly, u * 0.52);
-    lg.addColorStop(0, 'rgba(255,154,52,0.62)');
-    lg.addColorStop(0.35, 'rgba(255,124,28,0.22)');
-    lg.addColorStop(1, 'rgba(255,110,20,0)');
+    lg.addColorStop(0, th.lamp.light[0]);
+    lg.addColorStop(0.35, th.lamp.light[1]);
+    lg.addColorStop(1, th.lamp.light[2]);
     ctx.fillStyle = lg;
     ctx.beginPath();
     ctx.arc(bx, ly, u * 0.52, 0, 6.283);
     ctx.fill();
-    ctx.fillStyle = '#ffc061';
+    ctx.fillStyle = th.lamp.core;
     ctx.fillRect(bx - w * 0.22, ly - h * 0.085, w * 0.44, h * 0.17);
     ctx.restore();
     ctx.globalAlpha = 1;
   }
 
   /* 萤火：既是气氛，也是深度线索 —— 不同高度的萤火按各自深度做视差，
-   * 眼睛会下意识读出"这是立体的"。 */
+   * 眼睛会下意识读出"这是立体的"。
+   * 数量与色值走主题：白天的地图 flies = 0（白天点萤火是穿帮），
+   * 沙漠换成暖色浮尘 —— 换的只是数据，这段代码一行没变。 */
   function drawFireflies(scroll) {
+    var th = theme();
+    if (th.flies <= 0) return;
     var span = 120;
     ctx.save();
     ctx.globalCompositeOperation = 'lighter';
-    for (var i = 0; i < SCENE.fireflies; i++) {
+    for (var i = 0; i < th.flies; i++) {
       var r = hashSeq(hashOf(i, 21, 1));
       var D = r() * span;
       var y3d = ((D - scroll) % span + span) % span;
@@ -1412,9 +1869,9 @@
       if (a < 0.02) continue;
       var rad = Math.max(1.8, u * 0.30);
       var g = ctx.createRadialGradient(fx, fy, 0, fx, fy, rad);
-      g.addColorStop(0, 'rgba(255,232,160,' + (0.55 * a).toFixed(3) + ')');
-      g.addColorStop(0.35, 'rgba(205,255,175,' + (0.22 * a).toFixed(3) + ')');
-      g.addColorStop(1, 'rgba(180,255,160,0)');
+      g.addColorStop(0, 'rgba(' + th.fly.a + ',' + (0.55 * a).toFixed(3) + ')');
+      g.addColorStop(0.35, 'rgba(' + th.fly.b + ',' + (0.22 * a).toFixed(3) + ')');
+      g.addColorStop(1, 'rgba(' + th.fly.c + ',0)');
       ctx.fillStyle = g;
       ctx.beginPath();
       ctx.arc(fx, fy, rad, 0, 6.283);
@@ -1441,12 +1898,14 @@
   /* ---------- 各类景物 ----------
    * 约定：bx/by = 落地点（画布坐标），u = 该深度下 1 米等于多少像素。
    * 所有尺寸都乘 u，所以同一物件在近处大、远处小，自动跟透视一致。
-   * r 是稳定伪随机序列（同一槽位每次重开都一样）。 */
+   * r 是稳定伪随机序列（同一槽位每次重开都一样）。
+   * 颜色一律走 theme().P —— 同一段形状在三张地图上长成三种植物/石头，
+   * 靠的是换色 + 换种类（MAPS 里的 kinds），不是复制三份绘制代码。 */
   var PROPS = {
     /* 草簇：最便宜、密度最高，负责把路肩"长满" */
     grass: function (bx, by, u, r) {
       var n = 4 + Math.floor(r() * 3), h = (0.26 + r() * 0.22) * u;
-      ctx.strokeStyle = '#122219';
+      ctx.strokeStyle = theme().P.grass;
       ctx.lineWidth = Math.max(1, u * 0.05);
       ctx.lineCap = 'round';
       ctx.beginPath();
@@ -1459,20 +1918,22 @@
     },
 
     bush: function (bx, by, u, r) {
+      var th = theme().P;
       var w = (0.55 + r() * 0.45) * u, h = w * 0.72;
-      ctx.fillStyle = '#0f1c16';
+      ctx.fillStyle = th.bush;
       ctx.beginPath();
       ctx.ellipse(bx, by - h * 0.48, w * 0.5, h * 0.5, 0, 0, 6.283);
       ctx.fill();
-      ctx.fillStyle = '#14251c';
+      ctx.fillStyle = th.bushTop;
       ctx.beginPath();
       ctx.ellipse(bx - w * 0.15, by - h * 0.62, w * 0.33, h * 0.34, 0, 0, 6.283);
       ctx.fill();
     },
 
     rock: function (bx, by, u, r) {
+      var th = theme().P;
       var w = (0.55 + r() * 0.85) * u, h = w * (0.5 + r() * 0.35);
-      ctx.fillStyle = '#0f151e';
+      ctx.fillStyle = th.rock;
       ctx.beginPath();
       ctx.moveTo(bx - w * 0.5, by);
       ctx.lineTo(bx - w * 0.36, by - h * 0.72);
@@ -1481,7 +1942,7 @@
       ctx.lineTo(bx + w * 0.5, by);
       ctx.closePath();
       ctx.fill();
-      ctx.fillStyle = '#171f2a';                 // 受光的顶面
+      ctx.fillStyle = th.rockTop;                // 受光的顶面
       ctx.beginPath();
       ctx.moveTo(bx - w * 0.36, by - h * 0.72);
       ctx.lineTo(bx - w * 0.02, by - h);
@@ -1492,19 +1953,20 @@
     },
 
     bamboo: function (bx, by, u, r) {
+      var th = theme().P;
       var n = 3 + Math.floor(r() * 3), H0 = (3.0 + r() * 1.8) * u;
       for (var i = 0; i < n; i++) {
         var x = bx + (i - (n - 1) / 2) * u * 0.15 + (r() - 0.5) * u * 0.06;
         var h = H0 * (0.68 + r() * 0.46);
         var lean = (r() - 0.5) * 0.5;
         var tipX = x + lean * u * 0.55;
-        ctx.strokeStyle = i % 2 ? '#122219' : '#16291e';
+        ctx.strokeStyle = i % 2 ? th.stalkA : th.stalkB;
         ctx.lineWidth = Math.max(1, u * 0.055);
         ctx.beginPath();
         ctx.moveTo(x, by);
         ctx.quadraticCurveTo(x + lean * u * 0.18, by - h * 0.55, tipX, by - h);
         ctx.stroke();
-        ctx.strokeStyle = '#193023';              // 竹叶
+        ctx.strokeStyle = th.leafC;               // 竹叶
         ctx.lineWidth = Math.max(1, u * 0.035);
         for (var j = 0; j < 3; j++) {
           var ly = by - h * (0.66 + j * 0.12), sgn = j % 2 ? 1 : -1;
@@ -1517,15 +1979,16 @@
     },
 
     pine: function (bx, by, u, r) {
+      var th = theme().P;
       var h = (4.2 + r() * 3.2) * u, w = h * (0.32 + r() * 0.09);
-      ctx.fillStyle = '#080d12';
+      ctx.fillStyle = th.trunk;
       ctx.fillRect(bx - h * 0.022, by - h * 0.34, h * 0.044, h * 0.34);
       var tiers = 3 + Math.floor(r() * 2);
       for (var i = 0; i < tiers; i++) {
         var t0 = 0.22 + (i / tiers) * 0.60;
         var cw = w * (1 - i / (tiers + 0.5));
         var yb = by - h * t0, yt = by - h * (t0 + 0.46);
-        ctx.fillStyle = i === 0 ? '#0c1714' : '#0a1310';
+        ctx.fillStyle = i === 0 ? th.pineA : th.pineB;
         ctx.beginPath();
         ctx.moveTo(bx, yt);
         ctx.lineTo(bx + cw * 0.5, yb);
@@ -1535,7 +1998,7 @@
       }
       // 顶端一道冷色受光边 —— 深色剪影里没有它就会糊成一团
       var ytp = by - h * (0.22 + 0.60 + 0.46);
-      ctx.strokeStyle = 'rgba(150,196,235,0.20)';
+      ctx.strokeStyle = th.edge;
       ctx.lineWidth = Math.max(1, u * 0.03);
       ctx.beginPath();
       ctx.moveTo(bx - w * 0.5 * (1 - (tiers - 1) / (tiers + 0.5)) * 0.5, ytp + h * 0.46);
@@ -1544,22 +2007,24 @@
     },
 
     broadleaf: function (bx, by, u, r) {
+      var th = theme().P;
       var h = (3.4 + r() * 2.2) * u;
       var cw = h * (0.56 + r() * 0.18), ch = h * 0.56;
-      ctx.fillStyle = '#080d12';
+      ctx.fillStyle = th.trunk;
       ctx.fillRect(bx - h * 0.026, by - h * 0.44, h * 0.052, h * 0.44);
       var cx = bx + (r() - 0.5) * h * 0.08;
-      ctx.fillStyle = '#0b1611';
+      ctx.fillStyle = th.leafA;
       treeBlob(cx, by - h * 0.68, cw * 0.50, ch * 0.50, 12, 0.13, r);
-      ctx.fillStyle = '#0f1d16';
+      ctx.fillStyle = th.leafB;
       treeBlob(cx - cw * 0.15, by - h * 0.79, cw * 0.31, ch * 0.30, 9, 0.20, r);
       treeBlob(cx + cw * 0.19, by - h * 0.70, cw * 0.26, ch * 0.26, 9, 0.20, r);
     },
 
     /* 幡旗：布面随时间轻摆，给静止的夜色加一点"风" */
     banner: function (bx, by, u, r) {
+      var th = theme().P;
       var h = (2.7 + r() * 1.2) * u;
-      ctx.strokeStyle = '#151d27';
+      ctx.strokeStyle = th.pole;
       ctx.lineWidth = Math.max(1, u * 0.045);
       ctx.beginPath();
       ctx.moveTo(bx, by);
@@ -1567,7 +2032,7 @@
       ctx.stroke();
       var wob = Math.sin(animT * 1.6 + bx * 0.02 + r() * 6.283) * u * 0.06;
       var w = u * 0.44, top = by - h * 0.96, bot = by - h * 0.46;
-      ctx.fillStyle = '#1e2c40';
+      ctx.fillStyle = th.cloth;
       ctx.beginPath();
       ctx.moveTo(bx, top);
       ctx.lineTo(bx + w, top);
@@ -1575,7 +2040,7 @@
       ctx.lineTo(bx, bot);
       ctx.closePath();
       ctx.fill();
-      ctx.fillStyle = 'rgba(206,228,255,0.26)';
+      ctx.fillStyle = th.emblem;
       ctx.beginPath();
       ctx.arc(bx + w * 0.44, (top + bot) / 2, u * 0.10, 0, 6.283);
       ctx.fill();
@@ -1583,26 +2048,28 @@
 
     /* 茅屋／客栈：墙和屋顶都要比地面亮，否则只剩两扇暖窗浮在暗处，看不出是房子 */
     hut: function (bx, by, u, r) {
+      var th = theme().P;
       var w = (2.8 + r() * 1.5) * u, h = w * 0.40, roof = w * 0.30;
-      ctx.fillStyle = '#1d2735';
+      ctx.fillStyle = th.wall;
       ctx.fillRect(bx - w / 2, by - h, w, h);
-      ctx.fillStyle = '#26313f';
+      ctx.fillStyle = th.roof;
       ctx.beginPath();
       ctx.moveTo(bx - w * 0.62, by - h);
       ctx.lineTo(bx, by - h - roof);
       ctx.lineTo(bx + w * 0.62, by - h);
       ctx.closePath();
       ctx.fill();
-      ctx.fillStyle = 'rgba(255,188,112,0.62)';
+      ctx.fillStyle = th.window;
       ctx.fillRect(bx - w * 0.31, by - h * 0.70, w * 0.17, h * 0.32);
       ctx.fillRect(bx + w * 0.12, by - h * 0.70, w * 0.17, h * 0.32);
-      ctx.fillStyle = 'rgba(0,0,0,0.35)';      // 檐下阴影：给屋顶一点厚度
+      ctx.fillStyle = th.eave;                  // 檐下阴影：给屋顶一点厚度
       ctx.fillRect(bx - w * 0.62, by - h, w * 1.24, h * 0.07);
     },
 
     gate: function (bx, by, u, r) {
+      var th = theme().P;
       var h = (4.2 + r() * 1.8) * u, w = h * 0.74;
-      ctx.fillStyle = '#0a1017';
+      ctx.fillStyle = th.stone;
       ctx.fillRect(bx - w / 2, by - h, w * 0.09, h);
       ctx.fillRect(bx + w / 2 - w * 0.09, by - h, w * 0.09, h);
       ctx.fillRect(bx - w * 0.72, by - h, w * 1.44, h * 0.10);
@@ -1616,8 +2083,9 @@
     },
 
     pagoda: function (bx, by, u, r) {
+      var th = theme().P;
       var h = (7 + r() * 6) * u, w = h * 0.34;
-      ctx.fillStyle = '#0d141d';
+      ctx.fillStyle = th.tower;
       for (var i = 0; i < 4; i++) {
         var tw = w * (1 - (i / 4) * 0.40);
         var ty = by - h * (i / 4) * 0.78;
@@ -1631,6 +2099,164 @@
         ctx.fill();
       }
       ctx.fillRect(bx - u * 0.06, by - h * 1.04, u * 0.12, h * 0.16);
+    },
+
+    /* ---------- 以下五种是沙漠地图专用 ----------
+     * 每种都必须同时给出"最坏横向半宽"（写在 dev/e2e-test.js 的 halfWidth 表里）——
+     * 漏写的话测试按 0 算，物件就能悄悄怼到路面上而不报错。 */
+
+    /* 柱状仙人掌：主干 + 两条上举的臂 */
+    cactus: function (bx, by, u, r) {
+      var th = theme().P;
+      var h = (1.15 + r() * 0.95) * u, w = u * 0.30;
+      ctx.fillStyle = th.cactus;
+      ctx.fillRect(bx - w * 0.5, by - h, w, h);
+      var armH = h * 0.42, armW = w * 0.62;
+      var ay1 = by - h * 0.62, ay2 = by - h * 0.44;
+      ctx.fillRect(bx - w * 0.5 - u * 0.26, ay1 - armH, armW, armH);
+      ctx.fillRect(bx - w * 0.5 - u * 0.26, ay1 - armH, u * 0.26, u * 0.09);
+      ctx.fillRect(bx + w * 0.5, ay2 - armH * 0.86, armW, armH * 0.86);
+      ctx.fillRect(bx + w * 0.5 + u * 0.26 - u * 0.09, ay2 - armH * 0.86, u * 0.26, u * 0.09);
+      ctx.fillStyle = th.cactusDark;            // 背光的一侧
+      ctx.fillRect(bx - w * 0.5, by - h, w * 0.34, h);
+    },
+
+    /* 小沙丘（贴路带用）：只留一道弧 */
+    dune: function (bx, by, u, r) {
+      var th = theme().P;
+      var w = (0.9 + r() * 0.5) * u, h = w * (0.16 + r() * 0.10);
+      ctx.fillStyle = th.dune;
+      ctx.beginPath();
+      ctx.ellipse(bx, by, w * 0.5, h, 0, Math.PI, 0);
+      ctx.fill();
+      ctx.fillStyle = th.duneTop;               // 迎风坡的亮面
+      ctx.beginPath();
+      ctx.ellipse(bx + w * 0.12, by, w * 0.26, h * 0.62, 0, Math.PI, 0);
+      ctx.fill();
+    },
+
+    /* 大台地（中/远景带）：平顶的岩台，沙漠天际线的骨架 */
+    mesa: function (bx, by, u, r) {
+      var th = theme().P;
+      var w = (3.0 + r() * 1.6) * u, h = w * (0.42 + r() * 0.26);
+      ctx.fillStyle = th.mesa;
+      ctx.beginPath();
+      ctx.moveTo(bx - w * 0.5, by);
+      ctx.lineTo(bx - w * 0.34, by - h);
+      ctx.lineTo(bx + w * 0.30, by - h);
+      ctx.lineTo(bx + w * 0.5, by);
+      ctx.closePath();
+      ctx.fill();
+      ctx.fillStyle = th.mesaTop;               // 落日在顶面留下的亮边
+      ctx.beginPath();
+      ctx.moveTo(bx - w * 0.34, by - h);
+      ctx.lineTo(bx + w * 0.30, by - h);
+      ctx.lineTo(bx + w * 0.24, by - h * 0.88);
+      ctx.lineTo(bx - w * 0.28, by - h * 0.88);
+      ctx.closePath();
+      ctx.fill();
+      ctx.fillStyle = th.ruinTop;               // 背光面
+      ctx.beginPath();
+      ctx.moveTo(bx + w * 0.10, by - h);
+      ctx.lineTo(bx + w * 0.30, by - h);
+      ctx.lineTo(bx + w * 0.5, by);
+      ctx.lineTo(bx + w * 0.26, by);
+      ctx.closePath();
+      ctx.fill();
+    },
+
+    /* 断柱：商道废墟 */
+    ruin: function (bx, by, u, r) {
+      var th = theme().P;
+      var w = (0.66 + r() * 0.30) * u, h = (1.5 + r() * 1.5) * u;
+      ctx.fillStyle = th.ruin;
+      ctx.fillRect(bx - w * 0.5, by - h, w, h);
+      ctx.fillStyle = th.ruinTop;
+      ctx.fillRect(bx - w * 0.5, by - h, w, h * 0.10);
+      ctx.beginPath();                           // 断口：斜切一角
+      ctx.moveTo(bx + w * 0.5, by - h);
+      ctx.lineTo(bx + w * 0.5, by - h * 0.72);
+      ctx.lineTo(bx + w * 0.16, by - h);
+      ctx.closePath();
+      ctx.fill();
+      ctx.fillStyle = th.ruinTop;                 // 脚下的碎块
+      ctx.fillRect(bx - w * 0.86, by - h * 0.16, w * 0.5, h * 0.16);
+    },
+
+    /* 帐篷：商队的三角帐 */
+    tent: function (bx, by, u, r) {
+      var th = theme().P;
+      var w = (2.2 + r() * 0.8) * u, h = w * 0.62;
+      ctx.fillStyle = th.tent;
+      ctx.beginPath();
+      ctx.moveTo(bx - w * 0.5, by);
+      ctx.lineTo(bx + w * 0.02, by - h);
+      ctx.lineTo(bx + w * 0.5, by);
+      ctx.closePath();
+      ctx.fill();
+      ctx.fillStyle = th.tentDark;               // 门洞
+      ctx.beginPath();
+      ctx.moveTo(bx - w * 0.10, by);
+      ctx.lineTo(bx + w * 0.02, by - h * 0.52);
+      ctx.lineTo(bx + w * 0.16, by);
+      ctx.closePath();
+      ctx.fill();
+      ctx.strokeStyle = th.pole;                 // 支杆
+      ctx.lineWidth = Math.max(1, u * 0.035);
+      ctx.beginPath();
+      ctx.moveTo(bx + w * 0.02, by - h);
+      ctx.lineTo(bx + w * 0.02, by - h * 1.16);
+      ctx.stroke();
+    },
+
+    /* 棕榈：弯干 + 六片叶 */
+    palm: function (bx, by, u, r) {
+      var th = theme().P;
+      var h = (3.6 + r() * 2.2) * u;
+      var lean = (r() - 0.5) * 0.6;
+      var tipX = bx + lean * h * 0.28, tipY = by - h;
+      ctx.strokeStyle = th.trunk;
+      ctx.lineWidth = Math.max(1.5, u * 0.16);
+      ctx.lineCap = 'round';
+      ctx.beginPath();
+      ctx.moveTo(bx, by);
+      ctx.quadraticCurveTo(bx + lean * h * 0.06, by - h * 0.6, tipX, tipY);
+      ctx.stroke();
+      var n = 6, frond = (0.85 + r() * 0.35) * u;
+      for (var i = 0; i < n; i++) {
+        var a = Math.PI + (i / (n - 1)) * Math.PI;          // 从左侧扫到右侧
+        var ex = tipX + Math.cos(a) * frond * 1.25;
+        var ey = tipY + Math.sin(a) * frond * 0.75 + frond * 0.42;
+        ctx.strokeStyle = i % 2 ? th.palmLeaf : th.palmLeaf2;
+        ctx.lineWidth = Math.max(1, u * 0.075);
+        ctx.beginPath();
+        ctx.moveTo(tipX, tipY);
+        ctx.quadraticCurveTo((tipX + ex) / 2, Math.min(tipY, ey) - frond * 0.30, ex, ey);
+        ctx.stroke();
+      }
+    },
+
+    /* 方尖碑：远景带的地标 */
+    obelisk: function (bx, by, u, r) {
+      var th = theme().P;
+      var h = (4.0 + r() * 2.4) * u, w = h * 0.13;
+      ctx.fillStyle = th.ruin;
+      ctx.beginPath();
+      ctx.moveTo(bx - w * 0.5, by);
+      ctx.lineTo(bx - w * 0.34, by - h);
+      ctx.lineTo(bx, by - h * 1.10);
+      ctx.lineTo(bx + w * 0.34, by - h);
+      ctx.lineTo(bx + w * 0.5, by);
+      ctx.closePath();
+      ctx.fill();
+      ctx.fillStyle = th.ruinTop;
+      ctx.beginPath();
+      ctx.moveTo(bx - w * 0.12, by - h);
+      ctx.lineTo(bx, by - h * 1.10);
+      ctx.lineTo(bx + w * 0.34, by - h);
+      ctx.lineTo(bx + w * 0.12, by);
+      ctx.closePath();
+      ctx.fill();
     }
   };
 
@@ -1742,7 +2368,7 @@
     // 影子
     ctx.beginPath();
     ctx.ellipse(cx, baseY, rPx * 1.15, rPx * 0.36, 0, 0, 6.283);
-    ctx.fillStyle = 'rgba(0,0,0,0.42)';
+    ctx.fillStyle = 'rgba(0,0,0,' + theme().shadow + ')';
     ctx.fill();
 
     // 蓄力：脚下的收缩圈（表示"憋住了"，落点预警另有专门的 drawTelegraphs）
@@ -1922,77 +2548,348 @@
     ctx.restore();
   }
 
-  function drawPlayer() {
-    var p = road.project(G.x3d, CFG.playerY);
-    var sc = p.scale;
-    var hPx = 1.75 * pxPerMeter * sc;
-    var cx = p.pos.x, baseY = p.pos.y;
-    var wPx = hPx * 0.34;
+  /* ══════════════════ 人物形象（皮肤 × 性别） ══════════════════
+   * drawFigure 是**唯一**画人的地方：游戏里画、商城立绘也画，用的是同一段代码。
+   * 这样"商城里看到长什么样，进游戏就是什么样"是结构性成立的，不靠两张图对齐。
+   *
+   * 几何基准就是改动前那套画法（身高 1.75 米、身宽 = 身高 × 0.34、四点多边形、
+   * 头顶在 baseY − 0.84·h），所以"初始皮肤 + 男款"画出来的轮廓与改动前一致 ——
+   * 皮肤数据里的 shK / hipK 都以它为 1.0。
+   *
+   * 男女款差在哪（用户的要求是"换性别不换皮肤"）：只差 shK（肩）/
+   * hipK（下摆）/ hair / skirt 这几个体型参数，配色一律共用。
+   * 也就是说斯巴达的男款女款都是青铜甲+赤缨，只是肩宽、发型、裙摆不同。
+   */
 
-    ctx.save();
+  /* 头饰。c = 颜色，b = 底色（头发/头布用）。全部按 h 等比，远处自然缩小。 */
+  function drawGear(kind, cx, hy, h, color, sk) {
+    if (!kind) return;
+    var r = h * 0.12;                      // 头半径（与 drawFigure 里一致）
+    ctx.fillStyle = color;
+    if (kind === 'plume') {
+      /* 盔缨：一条从耳侧扫到头顶再垂下的弧 */
+      ctx.beginPath();
+      ctx.moveTo(cx - r * 1.15, hy + r * 0.15);
+      ctx.quadraticCurveTo(cx + r * 0.2, hy - r * 3.0, cx + r * 0.95, hy + r * 0.2);
+      ctx.quadraticCurveTo(cx + r * 0.2, hy - r * 1.9, cx - r * 1.15, hy + r * 0.35);
+      ctx.closePath();
+      ctx.fill();
+    } else if (kind === 'turban') {
+      /* 缠头：包住上半头，右侧拖一条尾巾 */
+      ctx.beginPath();
+      ctx.ellipse(cx, hy - r * 0.30, r * 1.20, r * 0.86, 0, Math.PI, 0);
+      ctx.fill();
+      ctx.beginPath();
+      ctx.moveTo(cx + r * 0.9, hy - r * 0.5);
+      ctx.lineTo(cx + r * 1.5, hy + r * 0.9);
+      ctx.lineTo(cx + r * 1.0, hy + r * 0.7);
+      ctx.closePath();
+      ctx.fill();
+    } else if (kind === 'nemes') {
+      /* 埃及条纹头巾：两侧向下张成扇形的后垂布 */
+      ctx.beginPath();
+      ctx.moveTo(cx - r * 1.32, hy + r * 0.9);
+      ctx.lineTo(cx - r * 1.05, hy - r * 1.0);
+      ctx.lineTo(cx + r * 1.05, hy - r * 1.0);
+      ctx.lineTo(cx + r * 1.32, hy + r * 0.9);
+      ctx.lineTo(cx + r * 0.72, hy + r * 0.9);
+      ctx.lineTo(cx + r * 0.72, hy - r * 0.35);
+      ctx.lineTo(cx - r * 0.72, hy - r * 0.35);
+      ctx.lineTo(cx - r * 0.72, hy + r * 0.9);
+      ctx.closePath();
+      ctx.fill();
+    } else if (kind === 'kasa') {
+      /* 斗笠：一个大圆锥，压得很低 */
+      ctx.beginPath();
+      ctx.moveTo(cx, hy - r * 1.9);
+      ctx.lineTo(cx + r * 2.05, hy + r * 0.55);
+      ctx.lineTo(cx - r * 2.05, hy + r * 0.55);
+      ctx.closePath();
+      ctx.fill();
+      ctx.fillStyle = 'rgba(0,0,0,0.22)';    // 帽檐下的阴影
+      ctx.fillRect(cx - r * 2.05, hy + r * 0.34, r * 4.1, r * 0.22);
+    } else if (kind === 'horn') {
+      /* 角盔：半个圆盔 + 两只角 */
+      ctx.beginPath();
+      ctx.ellipse(cx, hy, r * 1.18, r * 1.05, 0, Math.PI, 0);
+      ctx.fill();
+      for (var s = -1; s <= 1; s += 2) {
+        ctx.beginPath();
+        ctx.moveTo(cx + s * r * 0.72, hy - r * 0.72);
+        ctx.quadraticCurveTo(cx + s * r * 2.5, hy - r * 1.5, cx + s * r * 2.1, hy - r * 2.1);
+        ctx.quadraticCurveTo(cx + s * r * 1.7, hy - r * 1.25, cx + s * r * 0.55, hy - r * 0.5);
+        ctx.closePath();
+        ctx.fill();
+      }
+    } else if (kind === 'band') {
+      /* 发带：一条窄带 + 脑后两条飘带 */
+      ctx.fillRect(cx - r * 1.06, hy - r * 0.55, r * 2.12, r * 0.30);
+      for (var t = 0; t < 2; t++) {
+        ctx.beginPath();
+        ctx.moveTo(cx - r * 1.02, hy - r * 0.42);
+        ctx.quadraticCurveTo(cx - r * 2.0, hy + r * 0.3 + t * r * 0.3,
+          cx - r * 1.75, hy + r * 1.15 + t * r * 0.45);
+        ctx.lineTo(cx - r * 1.35, hy + r * 0.95 + t * r * 0.45);
+        ctx.quadraticCurveTo(cx - r * 1.5, hy + r * 0.3 + t * r * 0.3, cx - r * 0.78, hy - r * 0.4);
+        ctx.closePath();
+        ctx.fill();
+      }
+    }
+  }
+
+  /* 发型。头顶一律在 (cx, hy)，r = 头半径。 */
+  function drawHair(style, cx, hy, h, color) {
+    var r = h * 0.12;
+    if (style === 'bald') return;
+    ctx.fillStyle = color;
+    if (style === 'short') {
+      ctx.beginPath();
+      ctx.ellipse(cx, hy - r * 0.16, r * 1.06, r * 0.92, 0, Math.PI, 0);
+      ctx.fill();
+    } else if (style === 'bun') {
+      /* 束发：贴头皮的一层 + 顶上一个发髻（中式/浪人都用得上） */
+      ctx.beginPath();
+      ctx.ellipse(cx, hy - r * 0.10, r * 1.06, r * 0.94, 0, Math.PI, 0);
+      ctx.fill();
+      ctx.beginPath();
+      ctx.arc(cx, hy - r * 1.28, r * 0.46, 0, 6.283);
+      ctx.fill();
+    } else if (style === 'long') {
+      /* 长发：头顶一层 + 两侧垂到肩下 */
+      ctx.beginPath();
+      ctx.ellipse(cx, hy - r * 0.10, r * 1.08, r * 0.96, 0, Math.PI, 0);
+      ctx.fill();
+      ctx.beginPath();
+      ctx.moveTo(cx - r * 1.12, hy - r * 0.35);
+      ctx.quadraticCurveTo(cx - r * 1.55, hy + r * 1.7, cx - r * 1.0, hy + r * 2.5);
+      ctx.lineTo(cx - r * 0.55, hy + r * 2.4);
+      ctx.quadraticCurveTo(cx - r * 0.95, hy + r * 1.3, cx - r * 0.72, hy - r * 0.3);
+      ctx.closePath();
+      ctx.fill();
+      ctx.beginPath();
+      ctx.moveTo(cx + r * 1.12, hy - r * 0.35);
+      ctx.quadraticCurveTo(cx + r * 1.55, hy + r * 1.7, cx + r * 1.0, hy + r * 2.5);
+      ctx.lineTo(cx + r * 0.55, hy + r * 2.4);
+      ctx.quadraticCurveTo(cx + r * 0.95, hy + r * 1.3, cx + r * 0.72, hy - r * 0.3);
+      ctx.closePath();
+      ctx.fill();
+    } else if (style === 'ponytail') {
+      /* 马尾：头顶一层 + 脑后一条甩出去的高马尾 */
+      ctx.beginPath();
+      ctx.ellipse(cx, hy - r * 0.10, r * 1.06, r * 0.94, 0, Math.PI, 0);
+      ctx.fill();
+      ctx.beginPath();
+      ctx.moveTo(cx - r * 0.95, hy - r * 0.55);
+      ctx.quadraticCurveTo(cx - r * 2.6, hy - r * 0.2, cx - r * 2.35, hy + r * 1.6);
+      ctx.lineTo(cx - r * 1.75, hy + r * 1.5);
+      ctx.quadraticCurveTo(cx - r * 1.95, hy + r * 0.25, cx - r * 0.6, hy - r * 0.05);
+      ctx.closePath();
+      ctx.fill();
+    }
+  }
+
+  /* 手上的家伙。全按 h 等比，anchor 在身体右侧。 */
+  function drawWeapon(w, cx, baseY, h, wPx, lean) {
+    if (!w) return;
+    var kind = w.kind;
+    ctx.strokeStyle = w.color;
+    ctx.lineCap = 'round';
+    if (kind === 'sword') {
+      /* 与改动前逐字一致的一剑 */
+      ctx.lineWidth = Math.max(1.5, h * 0.036);
+      ctx.beginPath();
+      ctx.moveTo(cx + wPx * 0.68, baseY - h * 0.12);
+      ctx.lineTo(cx + wPx * 0.56 + lean * 0.8, baseY - h * 0.98);
+      ctx.stroke();
+    } else if (kind === 'spear') {
+      ctx.lineWidth = Math.max(1.2, h * 0.022);
+      ctx.beginPath();
+      ctx.moveTo(cx + wPx * 0.70, baseY - h * 0.02);
+      ctx.lineTo(cx + wPx * 0.62 + lean * 0.7, baseY - h * 1.42);
+      ctx.stroke();
+      ctx.fillStyle = w.color;               // 枪头
+      ctx.beginPath();
+      ctx.moveTo(cx + wPx * 0.62 + lean * 0.7, baseY - h * 1.66);
+      ctx.lineTo(cx + wPx * 0.86 + lean * 0.7, baseY - h * 1.36);
+      ctx.lineTo(cx + wPx * 0.40 + lean * 0.7, baseY - h * 1.38);
+      ctx.closePath();
+      ctx.fill();
+    } else if (kind === 'scimitar') {
+      ctx.lineWidth = Math.max(1.4, h * 0.032);
+      ctx.beginPath();
+      ctx.moveTo(cx + wPx * 0.60, baseY - h * 0.10);
+      ctx.quadraticCurveTo(cx + wPx * 1.5, baseY - h * 0.55, cx + wPx * 1.05 + lean * 0.7, baseY - h * 1.16);
+      ctx.stroke();
+    } else if (kind === 'katana') {
+      ctx.lineWidth = Math.max(1.4, h * 0.030);
+      ctx.beginPath();
+      ctx.moveTo(cx + wPx * 0.66, baseY - h * 0.14);
+      ctx.quadraticCurveTo(cx + wPx * 1.0, baseY - h * 0.6, cx + wPx * 0.80 + lean * 0.7, baseY - h * 1.08);
+      ctx.stroke();
+    } else if (kind === 'axe') {
+      ctx.lineWidth = Math.max(1.4, h * 0.028);
+      ctx.beginPath();
+      ctx.moveTo(cx + wPx * 0.66, baseY - h * 0.06);
+      ctx.lineTo(cx + wPx * 0.58 + lean * 0.7, baseY - h * 1.02);
+      ctx.stroke();
+      ctx.fillStyle = w.color;               // 斧刃
+      ctx.beginPath();
+      ctx.moveTo(cx + wPx * 0.58 + lean * 0.7, baseY - h * 1.10);
+      ctx.lineTo(cx + wPx * 1.42 + lean * 0.7, baseY - h * 1.00);
+      ctx.lineTo(cx + wPx * 0.64 + lean * 0.7, baseY - h * 0.76);
+      ctx.closePath();
+      ctx.fill();
+    } else if (kind === 'staff') {
+      ctx.lineWidth = Math.max(1.2, h * 0.024);
+      ctx.beginPath();
+      ctx.moveTo(cx + wPx * 0.70, baseY - h * 0.02);
+      ctx.lineTo(cx + wPx * 0.60 + lean * 0.7, baseY - h * 1.24);
+      ctx.stroke();
+      ctx.lineWidth = Math.max(1.1, h * 0.020);   // 杖头的环
+      ctx.beginPath();
+      ctx.arc(cx + wPx * 0.60 + lean * 0.7, baseY - h * 1.34, h * 0.072, 0, 6.283);
+      ctx.stroke();
+    } else if (kind === 'bow') {
+      ctx.lineWidth = Math.max(1.3, h * 0.028);
+      ctx.beginPath();                        // 弓臂（背在左肩）
+      ctx.moveTo(cx - wPx * 0.85, baseY - h * 0.16);
+      ctx.quadraticCurveTo(cx - wPx * 2.1, baseY - h * 0.62, cx - wPx * 0.85, baseY - h * 1.08);
+      ctx.stroke();
+      ctx.lineWidth = Math.max(1, h * 0.014);
+      ctx.beginPath();                        // 弦
+      ctx.moveTo(cx - wPx * 0.85, baseY - h * 0.16);
+      ctx.lineTo(cx - wPx * 0.85, baseY - h * 1.08);
+      ctx.stroke();
+    }
+  }
+
+  /* 画一个人。o = { lean:-1..1, trail:0..1, trailDir:±1, glow:color, shadowA:0..1 } */
+  function drawFigure(cx, baseY, h, sk, gender, o) {
+    var g = sk[gender === 'female' ? 'female' : 'male'];
+    var wPx = h * 0.34;
+    var lean = o.lean * wPx * 0.5;
+    var bodyTop = baseY - h * 0.84;
+    var hipW = wPx * 0.52 * g.hipK;
+    var shW = wPx * 0.30 * g.shK;
 
     // 影子
-    ctx.beginPath();
-    ctx.ellipse(cx, baseY, wPx * 0.95, wPx * 0.34, 0, 0, 6.283);
-    ctx.fillStyle = 'rgba(0,0,0,0.45)';
-    ctx.fill();
+    if (o.shadowA !== 0) {
+      ctx.beginPath();
+      ctx.ellipse(cx, baseY, wPx * 0.95, wPx * 0.34, 0, 0, 6.283);
+      ctx.fillStyle = 'rgba(0,0,0,' + (o.shadowA === undefined ? 0.45 : o.shadowA) + ')';
+      ctx.fill();
+    }
 
     // 侧移拖影：只有真的在横向移动时才出现，让"拖动"看起来是划过去而不是闪过去
-    var sp = clamp(Math.abs(G.vx) / CFG.playerMoveSpeed, 0, 1);
-    if (sp > 0.3) {
-      var sgn = G.vx > 0 ? -1 : 1;                 // 拖影留在运动的相反一侧
-      ctx.globalAlpha = ((sp - 0.3) / 0.7) * 0.45;
-      ctx.strokeStyle = '#9ecbff';
-      ctx.lineWidth = Math.max(1, hPx * 0.028);
+    if (o.trail > 0.3) {
+      var sgn = o.trailDir;
+      ctx.globalAlpha = ((o.trail - 0.3) / 0.7) * 0.45;
+      ctx.strokeStyle = sk.trail || sk.body.trim;
+      ctx.lineWidth = Math.max(1, h * 0.028);
       ctx.lineCap = 'round';
       for (var i = 0; i < 3; i++) {
-        var ly = baseY - hPx * (0.2 + i * 0.26);
+        var ly = baseY - h * (0.2 + i * 0.26);
         var l0 = cx + sgn * wPx * (0.72 + i * 0.24);
         ctx.beginPath();
         ctx.moveTo(l0, ly);
-        ctx.lineTo(l0 + sgn * hPx * (0.14 + 0.1 * i), ly);
+        ctx.lineTo(l0 + sgn * h * (0.14 + 0.1 * i), ly);
         ctx.stroke();
       }
       ctx.globalAlpha = 1;
     }
 
-    // 侧倾：上半身朝移动方向压一点，静止时归零
-    var lean = clamp(G.vx / CFG.playerMoveSpeed, -1, 1) * wPx * 0.5;
+    // 披风：画在身体之前（在身后）
+    if (sk.body.cape) {
+      ctx.fillStyle = sk.body.cape;
+      ctx.beginPath();
+      ctx.moveTo(cx - shW * 1.25, bodyTop + h * 0.14);
+      ctx.lineTo(cx + shW * 1.25, bodyTop + h * 0.14);
+      ctx.quadraticCurveTo(cx + wPx * (0.95 + g.skirt * 0.3), baseY - h * 0.20,
+        cx + wPx * 0.70, baseY - h * 0.02);
+      ctx.lineTo(cx - wPx * 0.70, baseY - h * 0.02);
+      ctx.quadraticCurveTo(cx - wPx * (0.95 + g.skirt * 0.3), baseY - h * 0.20,
+        cx - shW * 1.25, bodyTop + h * 0.14);
+      ctx.closePath();
+      ctx.fill();
+    }
 
-    var bodyTop = baseY - hPx * 0.84;
-    ctx.shadowBlur = 16;
-    ctx.shadowColor = G.hurtCd > 0.3 ? 'rgba(255,90,110,0.95)' : 'rgba(130,200,255,0.6)';
+    // 裙摆：比身体更宽的一段下摆，只在下半身露出来
+    if (g.skirt > 0.12) {
+      var hemW = wPx * (0.52 + g.skirt * 0.42);
+      ctx.globalAlpha = 0.92;
+      ctx.fillStyle = sk.body.robe[1];
+      ctx.beginPath();
+      ctx.moveTo(cx - wPx * 0.42, baseY - h * 0.34);
+      ctx.lineTo(cx + wPx * 0.42, baseY - h * 0.34);
+      ctx.lineTo(cx + hemW, baseY - h * 0.02);
+      ctx.lineTo(cx - hemW, baseY - h * 0.02);
+      ctx.closePath();
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+
+    ctx.shadowBlur = o.glowBlur === undefined ? 16 : o.glowBlur;
+    ctx.shadowColor = o.glow || 'rgba(130,200,255,0.6)';
 
     // 身体
     ctx.beginPath();
-    ctx.moveTo(cx - wPx * 0.52, baseY - hPx * 0.02);
-    ctx.lineTo(cx - wPx * 0.3 + lean, bodyTop + hPx * 0.17);
-    ctx.lineTo(cx + wPx * 0.3 + lean, bodyTop + hPx * 0.17);
-    ctx.lineTo(cx + wPx * 0.52, baseY - hPx * 0.02);
+    ctx.moveTo(cx - hipW, baseY - h * 0.02);
+    ctx.lineTo(cx - shW + lean, bodyTop + h * 0.17);
+    ctx.lineTo(cx + shW + lean, bodyTop + h * 0.17);
+    ctx.lineTo(cx + hipW, baseY - h * 0.02);
     ctx.closePath();
     var pg = ctx.createLinearGradient(0, bodyTop, 0, baseY);
-    pg.addColorStop(0, '#a8cfff');
-    pg.addColorStop(1, '#3d6cd4');
+    pg.addColorStop(0, sk.body.robe[0]);
+    pg.addColorStop(1, sk.body.robe[1]);
     ctx.fillStyle = pg;
     ctx.fill();
 
+    // 腰带：一条横过腰线的窄带（所有皮肤都有，颜色各异）
+    if (sk.body.belt) {
+      ctx.globalAlpha = 0.95;
+      ctx.fillStyle = sk.body.belt;
+      var bY = baseY - h * 0.40;
+      ctx.beginPath();
+      ctx.moveTo(cx - wPx * 0.44, bY);
+      ctx.lineTo(cx + wPx * 0.44, bY);
+      ctx.lineTo(cx + wPx * 0.46, bY + h * 0.07);
+      ctx.lineTo(cx - wPx * 0.46, bY + h * 0.07);
+      ctx.closePath();
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    }
+
     // 头
     ctx.beginPath();
-    ctx.arc(cx + lean, bodyTop + hPx * 0.04, hPx * 0.12, 0, 6.283);
-    ctx.fillStyle = '#ffe2bd';
+    ctx.arc(cx + lean, bodyTop + h * 0.04, h * 0.12, 0, 6.283);
+    ctx.fillStyle = sk.head.skin;
     ctx.fill();
 
     ctx.shadowBlur = 0;
 
-    // 剑
-    ctx.strokeStyle = '#d6ecff';
-    ctx.lineWidth = Math.max(1.5, hPx * 0.036);
-    ctx.lineCap = 'round';
-    ctx.beginPath();
-    ctx.moveTo(cx + wPx * 0.68, baseY - hPx * 0.12);
-    ctx.lineTo(cx + wPx * 0.56 + lean * 0.8, baseY - hPx * 0.98);
-    ctx.stroke();
+    // 头发 → 头饰（顺序固定：先发后冠，否则发髻会盖在盔缨上）
+    drawHair(g.hair, cx + lean, bodyTop + h * 0.04, h, sk.head.hair);
+    if (sk.gear) drawGear(sk.gear.kind, cx + lean, bodyTop + h * 0.04, h, sk.gear.color, sk);
 
+    // 剑/枪/斧…（原先的剑是画在 shadowBlur 归零之后的，保持一致）
+    drawWeapon(sk.weapon, cx, baseY, h, wPx, lean);
+  }
+
+  function drawPlayer() {
+    var p = road.project(G.x3d, CFG.playerY);
+    var sc = p.scale;
+    var hPx = 1.75 * pxPerMeter * sc;
+    var sk = skinOf(profile.skin);
+    var sp = clamp(Math.abs(G.vx) / CFG.playerMoveSpeed, 0, 1);
+    ctx.save();
+    drawFigure(p.pos.x, p.pos.y, hPx, sk, profile.gender, {
+      /* 侧倾：上半身朝移动方向压一点，静止时归零 */
+      lean: clamp(G.vx / CFG.playerMoveSpeed, -1, 1),
+      trail: sp,
+      trailDir: G.vx > 0 ? -1 : 1,          // 拖影留在运动的相反一侧
+      glow: G.hurtCd > 0.3 ? 'rgba(255,90,110,0.95)' : 'rgba(130,200,255,0.6)',
+      shadowA: 0.45
+    });
     ctx.restore();
   }
 
@@ -2014,19 +2911,36 @@
       var p = road.project(f.x, f.y);
       var a = clamp(Math.min(1, f.life * 3), 0, 1);
       var size = Math.round(15 * clamp(p.scale + 0.4, 0.65, 1.35));
+      var ty = p.pos.y - (1 - a) * 36;
       ctx.globalAlpha = a;
       ctx.font = '500 ' + size + 'px system-ui,-apple-system,"Microsoft YaHei",sans-serif';
       ctx.lineWidth = 3;
       ctx.strokeStyle = 'rgba(0,0,0,0.6)';
-      ctx.strokeText(f.text, p.pos.x, p.pos.y - (1 - a) * 36);
+      /* 金币浮字：数字前面带一枚小金饼。
+       * 不画图标的话，"金币 +2" 和 "积分 +10" 在屏幕上是两串几乎同色的黄字，
+       * 玩家分不清哪个是哪个 —— 而两者一个是持久货币、一个只是当局计分，
+       * 混淆的代价是有人的钱袋子莫名变多/变少。 */
+      var tx = p.pos.x;
+      if (f.coin) {
+        var rr = Math.max(2.4, size * 0.30);
+        var tw = ctx.measureText ? (ctx.measureText(f.text).width || 0) : 0;
+        var ccx = p.pos.x - tw / 2 - rr * 1.35;
+        var ccy = ty - size * 0.34;
+        ctx.beginPath(); ctx.arc(ccx, ccy, rr, 0, 6.283);
+        ctx.fillStyle = '#ffcf5a'; ctx.fill();
+        ctx.lineWidth = Math.max(1, rr * 0.3);
+        ctx.strokeStyle = 'rgba(122,78,6,0.9)'; ctx.stroke();
+        tx = p.pos.x + rr * 0.9;              // 文字给图标让出一点位置
+      }
+      ctx.strokeText(f.text, tx, ty);
       ctx.fillStyle = f.color;
-      ctx.fillText(f.text, p.pos.x, p.pos.y - (1 - a) * 36);
+      ctx.fillText(f.text, tx, ty);
     }
     ctx.globalAlpha = 1;
   }
 
   /* ══════════════════ HUD ══════════════════ */
-  var hudTick = 0, lastIcoHtml = '', lastPanelHtml = '';
+  var hudTick = 0, lastIcoHtml = '', lastPanelHtml = '', lastCoinGain = 0;
 
   var SVG_OPEN = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor"'
     + ' stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">';
@@ -2144,6 +3058,21 @@
     $('timeFill').style.width = ((1 - left / CFG.roundDuration) * 100).toFixed(1) + '%';
     $('weaponName').textContent = WEAPONS[G.weapon].name;
 
+    /* 局内金币：数字 + "跳一下"。
+     * 用 coinGain（进账次数）而不是金币数值来判断要不要跳 ——
+     * 同一帧连捡两只妖物的话，数值只变一次，跳两下才对得上玩家的感受。
+     * 重启动画必须"移除类 → 强制回流 → 加回来"，只加类的话第二次不会动。 */
+    $('coinText').textContent = G.coins;
+    if (G.coinGain !== lastCoinGain) {
+      lastCoinGain = G.coinGain;
+      var cl = $('coinLine');
+      if (cl) {
+        cl.classList.remove('pop');
+        void cl.offsetWidth;
+        cl.classList.add('pop');
+      }
+    }
+
     var ico = icoRowHtml();
     if (ico !== lastIcoHtml) { $('icoRow').innerHTML = ico; lastIcoHtml = ico; }
 
@@ -2162,11 +3091,229 @@
     toastTimer = setTimeout(function () { el.classList.remove('show'); }, 1500);
   }
 
+  /* ══════════════════ 商城 ══════════════════
+   * 三条设计上的取舍，都写在下面：
+   *  1) 缩略图**复用真实渲染管线**，不另画一套简化图 ——
+   *     另画一套的话，地图改了颜色、皮肤改了配色，商城里的预览还是旧的，
+   *     而"预览和实际不一致"是最伤信任的一类 bug。
+   *  2) 购买有二次确认：地图 4800 金币相当于十几局，误触一下就没了是不可接受的。
+   *  3) 初始地图/初始皮肤照列出来，但不标价、不显示"已拥有"——
+   *     它们是"默认款"，标"初始"更准；而且必须有入口，否则玩家买了新地图之后
+   *     想换回夜景都找不到地方。
+   */
+  var shopTab = 'all';                 // all | map | skin
+  var pendingBuy = null;
+  /* 缩略图的**像素缓冲**尺寸：TW×TH 是设计基准（132×168，3:4 略瘦的竖版），
+   * 实际缓冲乘 TDPR —— 矢量填充在 DPR 1 下会发虚，缩到卡片大小时边缘发毛
+   * （和游戏本体同一个道理）。显示尺寸由 CSS 决定（铺满卡片宽度）。 */
+  var TDPR = Math.min(2, (typeof window !== 'undefined' && window.devicePixelRatio) || 1);
+  var TW = 132, TH = 168;
+
+  var COIN_SVG = '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7"'
+    + ' stroke-linecap="round"><circle cx="12" cy="12" r="8.4"/>'
+    + '<circle cx="12" cy="12" r="3.4" fill="currentColor" stroke="none" opacity=".55"/></svg>';
+
+  function updateCoinDisplays() {
+    var h = $('homeCoins'), s = $('shopCoins');
+    if (h) h.textContent = profile.coins;
+    if (s) s.textContent = profile.coins;
+  }
+
+  /* 把"当前画布 / 投影器 / 地图主题 / 里程"临时换成缩略图那一套，跑完立刻还原。
+   * 商城要在同一帧里画出好几张**别的**地图，而所有绘制函数读的都是模块级变量 ——
+   * 与其给十几个绘制函数逐个加参数，不如在这里存旧值、换新值、finally 还原。
+   * 全程同步执行（中间没有 await），主循环不可能插进来画一帧（JS 单线程）。 */
+  function withTarget(c2, w2, h2, road2, ppm2, mapKey, fn) {
+    var sCtx = ctx, sW = W, sH = H, sRoad = road, sPpm = pxPerMeter;
+    var sScroll = bgScroll, sTheme = themeKey;
+    ctx = c2; W = w2; H = h2; road = road2; pxPerMeter = ppm2; themeKey = mapKey;
+    bgScroll = 137.5;                  // 固定里程：每次打开商城构图都一样，也避开 0 附近的空槽
+    try { fn(); } finally {
+      ctx = sCtx; W = sW; H = sH; road = sRoad; pxPerMeter = sPpm;
+      bgScroll = sScroll; themeKey = sTheme;
+    }
+  }
+
+  /* 地图缩略图：按游戏里同一套比例（近端占 52% 宽、消失点在 15.5% 高、k=48）
+   * 建一个缩小的投影器，然后把 sky/backdrop/road/scenery 原样跑一遍。 */
+  function renderMapThumb(cv, key) {
+    var c2 = cv.getContext('2d');
+    var tw = cv.width, thh = cv.height;
+    if (!c2 || !tw) return;
+    c2.setTransform(1, 0, 0, 1, 0, 0);
+    c2.clearRect(0, 0, tw, thh);
+    var pr = new RoadProjector({
+      left0: { x: tw * 0.5 - tw * 0.26, y: thh },
+      right0: { x: tw * 0.5 + tw * 0.26, y: thh },
+      vanish: { x: tw * 0.5, y: thh * 0.155 },
+      roadWidth: CFG.roadWidth, k: 48, maxDepth: 420
+    });
+    withTarget(c2, tw, thh, pr, pr.nearWidthPx / CFG.roadWidth, key, function () {
+      drawSky(); drawBackdrop(); drawRoad(); drawScenery();
+    });
+  }
+
+  /* 皮肤立绘：底色取**当前装备地图**的地面/雾色 —— 于是"皮肤卡"和"地图卡"
+   * 看起来是一套光照里的东西；换了地图，立绘的底色也跟着换。 */
+  function renderSkinThumb(cv, key) {
+    var c2 = cv.getContext('2d');
+    var tw = cv.width, thh = cv.height;
+    if (!c2 || !tw) return;
+    c2.setTransform(1, 0, 0, 1, 0, 0);
+    var th = theme();
+    var g = c2.createLinearGradient(0, 0, 0, thh);
+    g.addColorStop(0, th.sky[2]);
+    g.addColorStop(0.42, th.haze[2]);
+    g.addColorStop(1, th.ground[2]);
+    c2.fillStyle = g;
+    c2.fillRect(0, 0, tw, thh);
+    withTarget(c2, tw, thh, road, pxPerMeter, themeKey, function () {
+      drawFigure(tw * 0.5, thh * 0.93, thh * 0.74, skinOf(key), profile.gender,
+        { lean: 0, trail: 0, trailDir: 1, shadowA: 0.40, glowBlur: 10 });
+    });
+  }
+
+  function paintThumbs() {
+    var list = document.querySelectorAll('#shopGrid .thumbcv');
+    Array.prototype.forEach.call(list, function (cv) {
+      /* 缩略图是纯装饰，画不出来（老内核、无 canvas 环境）不该让整个商城打不开 */
+      try {
+        if (cv.getAttribute('data-kind') === 'map') renderMapThumb(cv, cv.getAttribute('data-key'));
+        else renderSkinThumb(cv, cv.getAttribute('data-key'));
+      } catch (e) {}
+    });
+  }
+
+  function shopItems() {
+    var out = [];
+    if (shopTab === 'all' || shopTab === 'map') {
+      MAPS.forEach(function (m) { out.push({ kind: 'map', d: m }); });
+    }
+    if (shopTab === 'all' || shopTab === 'skin') {
+      SKINS.forEach(function (s) { out.push({ kind: 'skin', d: s }); });
+    }
+    return out;
+  }
+
+  function cardHtml(it) {
+    var kind = it.kind, d = it.d;
+    var owned = owns(kind, d.key);
+    var using = (kind === 'map' ? profile.map : profile.skin) === d.key;
+    var base = d.price === 0;
+    var tag = using ? '<span class="tag using">使用中</span>'
+      : base ? '<span class="tag base">初始</span>'
+        : owned ? '<span class="tag own">已拥有</span>' : '';
+    var foot;
+    if (using) {
+      foot = '<span class="cprice free">当前使用</span>';
+    } else if (owned || base) {
+      /* 初始款和已购款在这里是同一种操作（切过去），所以并成一档 */
+      foot = '<span class="cprice free">' + (base ? '初始赠送' : '已拥有') + '</span>'
+        + '<button class="cbtn" data-act="equip" data-kind="' + kind + '" data-key="' + d.key + '">使用</button>';
+    } else {
+      var poor = profile.coins < d.price;
+      foot = '<span class="cprice' + (poor ? ' poor' : '') + '">' + COIN_SVG + d.price + '</span>'
+        + '<button class="cbtn buy" data-act="buy" data-kind="' + kind
+        + '" data-key="' + d.key + '">购买</button>';
+    }
+    var sub = kind === 'map' ? ('地图 · ' + d.sub) : (d.nation + ' · ' + d.job);
+    return '<div class="card' + (using ? ' using' : '') + '">'
+      /* width/height 属性 = **像素缓冲**尺寸（按 DPR 放大，否则矢量填充发虚）；
+       * 显示尺寸交给 CSS（.card .thumb canvas{width:100%;height:auto}）。
+       * 在这里再写一份内联 style 会和 CSS 打架：画布只占 132px、
+       * 右边空出一条黑边。 */
+      + '<div class="thumb"><canvas class="thumbcv" width="' + (TW * TDPR) + '" height="' + (TH * TDPR)
+      + '" data-kind="' + kind
+      + '" data-key="' + d.key + '"></canvas>' + tag + '</div>'
+      + '<div class="cbody"><div class="cname">' + d.name + '</div>'
+      + '<div class="csub">' + sub + '</div>'
+      + '<div class="cdesc">' + d.desc + '</div>'
+      + '<div class="cfoot">' + foot + '</div></div></div>';
+  }
+
+  function paintShop() {
+    updateCoinDisplays();
+    Array.prototype.forEach.call($('shopTabs').children, function (b) {
+      b.classList.toggle('on', b.getAttribute('data-tab') === shopTab);
+    });
+    /* 性别开关只在有皮肤卡片时才有意义（地图页显示它只会让人以为地图也分男女） */
+    var grow = $('genderRow');
+    if (grow) grow.classList.toggle('hidden', shopTab === 'map');
+    var seg = $('genderSeg');
+    if (seg) Array.prototype.forEach.call(seg.children, function (b) {
+      b.classList.toggle('on', b.getAttribute('data-gender') === profile.gender);
+    });
+
+    var out = '';
+    shopItems().forEach(function (it) { out += cardHtml(it); });
+    $('shopGrid').innerHTML = out;
+    paintThumbs();
+
+    var owned = profile.ownedMaps.length + profile.ownedSkins.length;
+    var total = MAPS.length + SKINS.length;
+    $('shopHint').textContent = '已解锁 ' + owned + ' / ' + total +
+      ' · 金币在每局结束时入账，买到的地图与皮肤永久保留';
+  }
+
+  function openShop() {
+    Sound.resume();
+    shopTab = 'all';
+    pendingBuy = null;
+    $('buyConfirm').classList.add('hidden');
+    setState('shop');
+    paintShop();
+  }
+
+  function closeShop() {
+    pendingBuy = null;
+    $('buyConfirm').classList.add('hidden');
+    setState('home');
+    updateCoinDisplays();
+  }
+
+  /* 装备/购买之后要同步的东西 */
+  function afterEquip(kind) {
+    /* 暗角强度是按地图缓存的渐变对象，换了地图必须重建，否则还是旧强度 */
+    if (kind === 'map') buildVignette();
+    paintShop();
+  }
+
+  function askBuy(kind, key) {
+    var d = kind === 'map' ? mapOf(key) : skinOf(key);
+    pendingBuy = { kind: kind, key: key };
+    var left = profile.coins - d.price;
+    $('bcName').textContent = d.name;
+    $('bcPrice').textContent = d.price + ' 金币';
+    $('bcSub').innerHTML = '当前余额 ' + profile.coins + ' 金币<br>'
+      + (left >= 0
+        ? '购买后剩余 ' + left + ' 金币。买下会立即装备。'
+        : '<span class="warn">还差 ' + (-left) + ' 金币 —— 再打几局就有了。</span>');
+    $('bcOk').disabled = left < 0;
+    $('bcOk').textContent = left < 0 ? '金币不足' : '确认购买';
+    $('buyConfirm').classList.remove('hidden');
+  }
+
+  function doBuy() {
+    if (!pendingBuy) return;
+    var kind = pendingBuy.kind;
+    var r = buy(pendingBuy.kind, pendingBuy.key);
+    pendingBuy = null;
+    $('buyConfirm').classList.add('hidden');
+    if (r.ok) {
+      Sound.init(); Sound.pickup(); vibrate(28);
+      toast('已购买并装备：' + r.item.name);
+    } else if (r.reason === 'poor') {
+      toast('金币不足，还差 ' + r.need);
+    }
+    afterEquip(kind);
+  }
+
   /* ══════════════════ 界面切换 ══════════════════ */
   function setState(s) {
     state = s;
     $('loading').classList.toggle('hidden', s !== 'loading');
     $('home').classList.toggle('hidden', s !== 'home');
+    $('shop').classList.toggle('hidden', s !== 'shop');
     $('result').classList.toggle('hidden', s !== 'result');
     $('hud').classList.toggle('hidden', !(s === 'playing' || s === 'paused'));
     /* HUD 一进一出的同时把属性面板也归位：新一局不该继承上一局展开的状态，
@@ -2210,23 +3357,45 @@
   function startGame() {
     Sound.init();
     Sound.resume();
+    /* 从设置里的"重新开始"进来时，手上还捏着上一局没入账的金币 —— 先记上再开新局。
+     * 顺序不能反：newGame() 会把 G 整个换掉，换掉之后就再也拿不到那笔钱了。 */
+    bankRun();
     newGame();
     lastIcoHtml = '';                          // 新一局强制重画图标行与面板
     lastPanelHtml = '';
+    lastCoinGain = 0;
     setState('playing');
     updateHud();
     toast('妖物来袭 · 坚持 3:00 即通关');
+  }
+
+  /* 把这一局挣到的金币记进存档。
+   * 幂等（G.banked）：结算、再来一局、返回主页、重新开始都可能走到这里，
+   * 不设标记的话"结算 → 返回主页"会把同一笔钱记两遍。
+   * 中途退出也照样入账 —— 击杀是真实发生的，没有作弊空间（想多挣就得多活、
+   * 多打），而"打断一局就把钱全扣掉"只会让玩家不敢随手关掉页面。 */
+  function bankRun() {
+    if (!G || G.banked) return 0;
+    G.banked = true;
+    var n = G.coins;
+    profile.coins += n;
+    profile.earned += n;
+    profile.runs++;
+    saveProfile();
+    return n;
   }
 
   function endGame(win) {
     if (state === 'result') return;
     state = 'result';
     Sound.init();
-    if (win) { Sound.win(); vibrate([40, 70, 40]); }
+    if (win) { Sound.win(); vibrate([40, 70, 40]); G.coins += CFG.coinBonusWin; }
     else { Sound.lose(); vibrate(220); }
 
     var isBest = G.score > bestScore;
     if (isBest) { bestScore = G.score; saveBest(); }
+
+    var gained = bankRun();
 
     var title = $('resTitle');
     title.textContent = win ? '通关' : '失败';
@@ -2238,6 +3407,9 @@
     $('resScore').textContent = G.score;
     $('resKills').textContent = G.kills;
     $('resTime').textContent = fmtTime(Math.min(G.t, CFG.roundDuration));
+    $('resCoinGain').textContent = '+' + gained;
+    $('resCoinBal').textContent = '余额 ' + profile.coins +
+      (win ? '（含通关奖励 +' + CFG.coinBonusWin + '）' : '');
     $('resBest').textContent = isBest
       ? '新纪录！历史最高积分 ' + bestScore
       : '历史最高积分 ' + bestScore;
@@ -2247,14 +3419,17 @@
 
   function goHome() {
     Sound.resume();
+    bankRun();                       // 中途返回也把已挣到的记上（幂等，不会重复记）
     G = null;
     $('bestScore').textContent = bestScore > 0 ? '历史最高积分 ' + bestScore : '';
     setState('home');
+    updateCoinDisplays();
   }
 
   /* ══════════════════ 事件绑定 ══════════════════ */
   function bindUI() {
     $('btnStart').addEventListener('click', startGame);
+    $('btnShop').addEventListener('click', openShop);
     $('btnHomeSettings').addEventListener('click', function () { openSettings('home'); });
     $('btnSettingsInGame').addEventListener('click', function () { openSettings('game'); });
     $('btnResume').addEventListener('click', closeSettings);
@@ -2269,6 +3444,40 @@
     });
     $('btnAgain').addEventListener('click', startGame);
     $('btnResHome').addEventListener('click', goHome);
+
+    /* ── 商城 ──
+     * 卡片是整段 innerHTML 重建的，所以事件一律用**委托**挂在稳定的父节点上：
+     * 给每张卡单独 addEventListener 的话，每次重绘都会留下一批指向旧 DOM 的监听器。 */
+    $('btnShopBack').addEventListener('click', closeShop);
+    $('shopTabs').addEventListener('click', function (e) {
+      var b = e.target.closest ? e.target.closest('[data-tab]') : null;
+      if (!b) return;
+      shopTab = b.getAttribute('data-tab');
+      paintShop();
+    });
+    $('genderSeg').addEventListener('click', function (e) {
+      var b = e.target.closest ? e.target.closest('[data-gender]') : null;
+      if (!b) return;
+      setGender(b.getAttribute('data-gender'));
+      paintShop();
+      toast(profile.gender === 'female' ? '已切换为女款' : '已切换为男款');
+    });
+    $('shopGrid').addEventListener('click', function (e) {
+      var b = e.target.closest ? e.target.closest('[data-act]') : null;
+      if (!b) return;
+      var act = b.getAttribute('data-act');
+      var kind = b.getAttribute('data-kind'), key = b.getAttribute('data-key');
+      if (act === 'buy') askBuy(kind, key);
+      else if (act === 'equip' && equip(kind, key)) {
+        toast('已切换：' + (kind === 'map' ? mapOf(key).name : skinOf(key).name));
+        afterEquip(kind);
+      }
+    });
+    $('bcOk').addEventListener('click', doBuy);
+    $('bcCancel').addEventListener('click', function () {
+      pendingBuy = null;
+      $('buyConfirm').classList.add('hidden');
+    });
 
     $('volRange').addEventListener('input', function (e) {
       settings.volume = (+e.target.value) / 100;
@@ -2330,6 +3539,7 @@
         $('loaderFill').style.width = '100%';
         setTimeout(function () {
           $('bestScore').textContent = bestScore > 0 ? '历史最高积分 ' + bestScore : '';
+          updateCoinDisplays();
           setState('home');
         }, 300);
       }
@@ -2345,19 +3555,60 @@
     CFG: CFG, ATTACK: ATTACK, WEAPONS: WEAPONS, MONSTERS: MONSTERS, BUFF_MAP: BUFF_MAP,
     BUFF_LIST: BUFF_LIST,
     SCENE: SCENE, PROPS: PROPS,
+    MAPS: MAPS, SKINS: SKINS,
     settings: settings,
+    /* 存档是**同一个对象**（不是拷贝）：测试可以直接改 profile.coins 来造场景，
+     * 也可以读它来断言"买完扣了多少"。 */
+    profile: profile,
     get perf() { return perf; },
     get G() { return G; },
     get state() { return state; },
     project: function (x, y) { return road.project(x, y); },
-    /* 枚举当前视野里的景物（不绘制）。给自动化测试清点用。 */
-    sceneItems: function (scroll, emit) { return sceneItems(scroll === undefined ? currentScroll() : scroll, emit); },
+    /* 某张地图的主题（不传就是当前装备的那张）。测试用它核对
+     * "夜图的色值是不是和抽主题前逐字一致"、"换地图后雾参数有没有跟着换"。 */
+    theme: function (key) { return mapOf(key || profile.map).th; },
+    /* 某张地图实际生效的景物带（种类已换成该地图的） */
+    beltsFor: function (key) { return beltsFor(key || profile.map); },
+    /* 枚举当前视野里的景物（不绘制）。给自动化测试清点用。
+     * 第三个参数可以指定地图 —— 测试要逐张地图验证"物件不许压到路面"。 */
+    sceneItems: function (scroll, emit, mapKey) {
+      return sceneItems(scroll === undefined ? currentScroll() : scroll, emit, mapKey);
+    },
     /* 路沿每段的几何与透明度（不绘制）。给测试断言"线宽随透视收缩、明度随距离衰减"用。 */
     curbSegments: function () { return curbSegments(); },
     /* 属性面板：开关 + 当前那几行数据（测试直接核对数字，不用去解 DOM） */
     toggleStats: function (force) { toggleStats(force); },
     statsRows: function () { return G ? statsRows() : []; },
-    playerStats: function () { return G ? playerStats() : null; }
+    playerStats: function () { return G ? playerStats() : null; },
+    /* 经济与商城：测试要能"给钱 → 进商城 → 点购买 → 核对余额与装备"整条走通，
+     * 所以把真实入口（而不是另写一份测试专用逻辑）暴露出来。 */
+    updateCoinDisplays: function () { updateCoinDisplays(); },
+    bankRun: function () { return bankRun(); },
+    saveProfile: function () { saveProfile(); },
+    shop: {
+      open: function () { openShop(); },
+      close: function () { closeShop(); },
+      /* ⚠ 这里**不能**同时提供 `tab(t)` 和 `get tab()`：
+       * 对象字面量里同名键后者胜，getter 会把函数整个覆盖掉，
+       * 于是 `RD.shop.tab('map')` 变成"把字符串当函数调用"，而且不报错、只是没生效。
+       * 分工：tab(t) 用来切筛选，currentTab 用来读当前筛选。 */
+      tab: function (t) { shopTab = t; paintShop(); },
+      get currentTab() { return shopTab; },
+      items: function () { return shopItems(); },
+      paint: function () { paintShop(); },
+      owns: function (kind, key) { return owns(kind, key); },
+      buy: function (kind, key) { return buy(kind, key); },
+      equip: function (kind, key) { return equip(kind, key); },
+      setGender: function (g) { return setGender(g); },
+      askBuy: function (kind, key) { askBuy(kind, key); },
+      confirm: function () { doBuy(); },
+      cardHtml: function (it) { return cardHtml(it); },
+      /* 缩略图是纯 canvas 的东西，jsdom 里没有真实上下文；
+       * 测试要验"预览真的走了渲染管线"就用这个入口（注入一个假 canvas）。 */
+      renderThumb: function (cv, kind, key) {
+        if (kind === 'map') renderMapThumb(cv, key); else renderSkinThumb(cv, key);
+      }
+    }
   };
 
   if (document.readyState === 'loading') {

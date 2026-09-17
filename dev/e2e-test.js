@@ -2,10 +2,22 @@
  * 用 stub 的 Canvas 2D 上下文跑完整帧循环，验证两条通关路径与设置面板。 */
 const fs = require('fs');
 const path = require('path');
-const { JSDOM } = require('jsdom');
+const { JSDOM, VirtualConsole } = require('jsdom');
 
 const DIR = 'C:/Users/Administrator/Desktop/road-defender';
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+/* jsdom 没带 canvas 实现，商城的缩略图会让它刷一屏
+ * "HTMLCanvasElement's getContext() method: without installing the canvas npm package"。
+ * 那是**预期内**的降级（renderMapThumb 里 `if (!c2 || !tw) return;` 兜住了，真机上照画不误），
+ * 所以只滤掉这一条 —— 把所有 jsdomError 一起吞掉的话，真正的错误也会被淹。
+ * 注意 jsdom 29 的 API 是 forwardTo(console, {jsdomErrors})，老版本叫 sendTo。 */
+const vconsole = new VirtualConsole();
+vconsole.forwardTo(console, { jsdomErrors: 'none' });
+vconsole.on('jsdomError', (e) => {
+  if (String((e && e.message) || e).indexOf('getContext') >= 0) return;
+  console.error('  [jsdom] ' + ((e && e.message) || e));
+});
 
 /* Windows 控制台是 GBK，中文日志经管道重定向会乱码 —— 顺手落一份 UTF-8 报告 */
 const REPORT = path.join(DIR, 'dev', '_report.txt');
@@ -35,7 +47,8 @@ function makeEnv() {
   const dom = new JSDOM(html, {
     runScripts: 'outside-only',
     pretendToBeVisual: true,
-    url: 'http://localhost/'
+    url: 'http://localhost/',
+    virtualConsole: vconsole
   });
   const w = dom.window;
 
@@ -457,12 +470,12 @@ async function testE() {
   const D = env.w.RD;
   const SCENE = D.SCENE, PROPS = D.PROPS, CFG = D.CFG;
 
-  /* 枚举一次，返回 [{kind,x3d,y3d,alpha,sx,sy}] */
-  const collect = (scroll) => {
+  /* 枚举一次，返回 [{kind,x3d,y3d,alpha,sx,sy}]。mapKey 传了就枚举那张地图的景物。 */
+  const collect = (scroll, mapKey) => {
     const out = [];
     D.sceneItems(scroll, (kind, x3d, y3d, q, alpha) => {
       out.push({ kind, x3d, y3d, alpha, sx: q.pos.x, sy: q.pos.y });
-    });
+    }, mapKey);
     return out;
   };
 
@@ -489,8 +502,12 @@ async function testE() {
    *    这张表是照 PROPS 里的绘制代码逐个算出来的**最坏情况**（参数取最大），
    *    不是拍的估值 —— 第一版我就凭印象填，结果漏掉了"竹叶其实伸到 1.06 米"，
    *    测试因此放过了真实的越界。
+   *    ⚠ 往 PROPS 里加新物件时**必须同时往这张表里加一行**：查不到的名字按 0 算，
+   *    物件于是可以悄悄怼到路面上而不报错（沙漠那张图的几种就是这么补进来的）。
    *    允许最多越界 0.30 米：竹叶/灌木梢探到路沿上方一点是刻意的，看着自然；
-   *    超过这个量就说明 minX 或某个物件被改大了，必须拦住。 */
+   *    超过这个量就说明 minX 或某个物件被改大了，必须拦住。
+   *    ⚠ 逐张地图跑，不能只跑当前装备的那张 —— 沙漠图有 7 种独有物件，
+   *    只测夜景的话它们一次都不会被枚举到。 */
   const halfWidth = {
     grass: 0.32,      // 草叶摆幅 ±0.32
     bush: 0.50,       // w 最大 1.0
@@ -501,21 +518,61 @@ async function testE() {
     banner: 0.44,
     hut: 2.15,        // 屋宽 4.3
     gate: 4.08,       // 檐口 ±w×0.92
-    pagoda: 2.30
+    pagoda: 2.30,
+    /* ── 以下 7 种是沙漠图专属 ── */
+    cactus: 0.58,     // 右臂：w*0.5(0.15) + u*0.26 + 臂宽 u*0.26
+    dune: 0.70,       // 丘宽最大 1.4 → 半径 0.7（迎风坡那瓣 w*0.38 更窄）
+    mesa: 2.30,       // 台面宽最大 4.6 → ±2.3
+    ruin: 0.83,       // 柱宽 0.96，脚边碎块外沿 w*0.86
+    tent: 1.50,       // 帐宽最大 3.0 → ±1.5（支杆在 w*0.02，可忽略）
+    palm: 1.99,       // 干倾斜 0.49（lean 0.3 × 高 5.8 × 0.28）+ 叶展 1.5（frond 1.2 × 1.25）
+    obelisk: 0.42      // 高 6.4 × 0.13 → 宽 0.83 → ±0.42
   };
   const roadHalf = CFG.roadWidth / 2;
   const OVERHANG = 0.30;
-  let worst = null, worstGap = Infinity;
-  for (const scroll of [0, 60, 400, 1500, 9000]) {
-    for (const o of collect(scroll)) {
-      const gap = Math.abs(o.x3d) - (halfWidth[o.kind] || 0) - roadHalf;
-      if (gap < worstGap) { worstGap = gap; worst = o.kind + ' x=' + o.x3d.toFixed(2) + ' @scroll' + scroll; }
+  const MAPKEYS = D.MAPS.map((m) => m.key);
+  for (const mk of MAPKEYS) {
+    let worst = null, worstGap = Infinity;
+    for (const scroll of [0, 60, 400, 1500, 9000]) {
+      for (const o of collect(scroll, mk)) {
+        const gap = Math.abs(o.x3d) - (halfWidth[o.kind] || 0) - roadHalf;
+        if (gap < worstGap) { worstGap = gap; worst = o.kind + ' x=' + o.x3d.toFixed(2) + ' @scroll' + scroll; }
+      }
     }
+    console.log('  [' + mk + '] 最贴近路面的景物：' + worst + '（' + (worstGap >= 0 ? '离路面还有 ' + worstGap.toFixed(2) + ' 米'
+      : '探到路沿上方 ' + (-worstGap).toFixed(2) + ' 米') + '）');
+    ok(worstGap >= -OVERHANG, '[' + mk + '] 没有景物明显压到路面上（最坏 ' + worstGap.toFixed(2) +
+      ' 米，允许探入 ' + OVERHANG + ' 米以内）');
   }
-  console.log('  最贴近路面的景物：' + worst + '（' + (worstGap >= 0 ? '离路面还有 ' + worstGap.toFixed(2) + ' 米'
-    : '探到路沿上方 ' + (-worstGap).toFixed(2) + ' 米') + '）');
-  ok(worstGap >= -OVERHANG, '没有景物明显压到路面上（最坏 ' + worstGap.toFixed(2) +
-    ' 米，允许探入 ' + OVERHANG + ' 米以内）');
+  /* ④b 表里不许有"查不到名字"的漏网：每张地图 kinds 里出现的种类都必须在表里 */
+  const missing = [];
+  MAPKEYS.forEach((mk) => D.beltsFor(mk).forEach((b) => b.kinds.forEach((k) => {
+    if (halfWidth[k] === undefined) missing.push(mk + ':' + k);
+  })));
+  ok(missing.length === 0, '每张地图的每种物件都登记了横向半宽' +
+    (missing.length ? '（漏了：' + missing.join('、') + ' —— 漏一个就等于放它去压路面）' : ''));
+
+  /* ④c 每张地图的景物必须**真的是那张图的种类**，而且真的有东西。
+   *     只换颜色不换种类的话，沙漠图里会长出竹林 —— 那种"贴图换了、模型没换"
+   *     的错看着像美术问题，其实是数据没生效。 */
+  const kindSet = (mk) => {
+    const s = new Set();
+    for (const sc of [0, 137.5, 900, 5000]) collect(sc, mk).forEach((o) => s.add(o.kind));
+    return s;
+  };
+  MAPKEYS.forEach((mk) => {
+    const ks = kindSet(mk);
+    ok(ks.size >= 3, '[' + mk + '] 该地图确实铺出了景物（' + ks.size + ' 种：' +
+      Array.from(ks).slice(0, 8).join('/') + '）');
+  });
+  const desertKinds = kindSet('desert');
+  const nightKinds = kindSet('night');
+  ok(desertKinds.has('cactus') && desertKinds.has('dune') && desertKinds.has('mesa'),
+    '沙漠图里出现了沙漠专属物件（cactus/dune/mesa）');
+  ok(!nightKinds.has('cactus') && !nightKinds.has('mesa') && !nightKinds.has('obelisk'),
+    '夜景里不会冒出仙人掌/台地/方尖碑（换地图真的换了种类，不是只换了颜色）');
+  ok(desertKinds.has('palm') !== nightKinds.has('palm'),
+    'palms 只属于沙漠 —— 种类是按地图选的，不是三张图共用一套');
 
   /* ⑤ 数量有界：scroll 拉到极远，可见物件数必须仍落在同一区间里。
    *    注意不能断言"恒定" —— 每条带是按等间距槽位取的，进出视野的槽位是否被
@@ -1041,6 +1098,460 @@ async function testJ() {
   env.w.close();
 }
 
+/* ═══════════════ 测试 K：金币经济（掉落 → 局内显示 → 结算入账 → 存档） ═══════════════
+ * 金币是**跨局持久**的货币，所以它比积分危险：积分算错了只是数字难看，
+ * 金币算错了要么让玩家白打（没入账），要么凭空发财（重复入账）。
+ * 这一组因此钉三件事：
+ *   · 掉落数值有依据、口径与 score 分开（coin 是"值多少钱"，score 是"打得好不好"）；
+ *   · 任何一条离开对局的路径都会入账，且**只入账一次**（bankRun 幂等）；
+ *   · 存档读进来必须逐字段校验 —— 一个不存在的皮肤 key 会让绘制抛异常，
+ *     症状是"打开就白屏"，而且清缓存才好。
+ */
+async function testK() {
+  console.log('\n=== 测试 K：金币经济 ===');
+  const raw = fs.readFileSync(path.join(DIR, 'game.js'), 'utf8');
+
+  const env = makeEnv();
+  env.w.Math.random = seeded(7788);
+  loadScripts(env.w);
+  await waitHome(env);
+  const D = env.w.RD, CFG = D.CFG, MON = D.MONSTERS;
+
+  /* ── ① 掉落数值 ── */
+  const keys = Object.keys(MON);
+  ok(keys.length >= 4, '妖物 ' + keys.length + ' 种');
+  let coinBad = null;
+  keys.forEach((k) => { if (!Number.isInteger(MON[k].coin) || MON[k].coin <= 0) coinBad = k; });
+  ok(!coinBad, '每种妖物都有正整数掉落金币' + (coinBad ? '（' + coinBad + ' 不合法）' : ''));
+
+  /* coin 与 score 是两套口径（一个"值多少钱"、一个"打得好不好"），
+   * 但排序不该互相打架 —— 否则会出现"打高分的怪反而掉得少"这种说不通的设定。 */
+  const byScore = keys.slice().sort((a, b) => MON[a].score - MON[b].score);
+  const ladder = byScore.map((k) => MON[k].name + ' ' + MON[k].score + '分/' + MON[k].coin + '币');
+  let mono = true;
+  for (let i = 1; i < byScore.length; i++) {
+    if (MON[byScore[i]].coin < MON[byScore[i - 1]].coin) mono = false;
+  }
+  console.log('  掉落阶梯：' + ladder.join(' → '));
+  ok(mono, '掉落金币随妖物价值单调不降（' + ladder.join(' → ') + '）');
+
+  const sumCoin = byScore.reduce((s, k) => s + MON[k].coin, 0);
+  ok(sumCoin < 20, '四种妖物的掉落总和 ' + sumCoin + ' 是一局能打死几十只的量级（不是几百）');
+
+  /* ── ② 真杀一遍：逐种各杀一只，核对"局内金币 = 掉落之和" ──
+   * 不复制一份掉落逻辑到测试里 —— 摆一只血量为 1 的靶子，让真实的弹道打它。 */
+  env.w.document.getElementById('btnStart').click();
+  ok(D.G.coins === 0 && D.G.coinGain === 0, '开局金币归零（coins=' + D.G.coins + '，coinGain=' + D.G.coinGain + '）');
+
+  const killOne = (mk) => {
+    const t = MON[mk];
+    const k0 = D.G.kills, c0 = D.G.coins, g0 = D.G.coinGain;
+    const pen = {
+      key: mk, type: t, x3d: 0, y3d: CFG.playerY + 10,
+      hp: 1, maxHp: 1, speed: 0, r: t.r, dmg: 0,
+      wob: 0, mode: 'walk', modeT: 0, lungeX: 0, hitFlash: 0, dead: false
+    };
+    let f = 0;
+    while (f < 180 && D.G.kills === k0) {
+      env.step(1, 16.67, () => {
+        const G = D.G;
+        G.monsters.length = 0;          // 场上有谁全由本用例说了算
+        G.monsters.push(pen);
+        pen.x3d = 0; pen.y3d = CFG.playerY + 10; pen.hp = 1; pen.dead = false;
+        pen.mode = 'walk'; pen.modeT = 0;
+        G.x3d = 0; G.weapon = 'sword'; G.fireTimer = 0; G.hp = 100;
+      });
+      f++;
+    }
+    return { killed: D.G.kills > k0, dCoin: D.G.coins - c0, dGain: D.G.coinGain - g0, frames: f };
+  };
+
+  let expectCoin = 0, allOk = true;
+  byScore.forEach((mk) => {
+    const r = killOne(mk);
+    expectCoin += MON[mk].coin;
+    if (!r.killed || r.dCoin !== MON[mk].coin || r.dGain !== 1) allOk = false;
+    console.log('  击杀 ' + MON[mk].name + '：+' + r.dCoin + ' 金币（期望 ' + MON[mk].coin +
+      '），进账 ' + r.dGain + ' 次，用了 ' + r.frames + ' 帧');
+  });
+  ok(allOk, '每次击杀恰好入账一次，且数额等于该妖物的掉落');
+  ok(D.G.coins === expectCoin, '局内金币 = 各次掉落之和（' + D.G.coins + ' = ' + expectCoin + '）');
+
+  /* ── ③ 局内 HUD 显示 ── */
+  D.G.bullets.length = 0;               // 清掉在飞的弹，免得它们在镜头外又打死几只
+  env.step(8, 16.67);                   // updateHud 每 4 帧跑一次
+  ok(txt(env.w, 'coinText') === String(D.G.coins),
+    'HUD 金币与局内数据一致（' + txt(env.w, 'coinText') + '）');
+  ok(env.w.document.getElementById('coinLine').classList.contains('pop'),
+    '有新进账时 HUD 金币跳了一下（.pop 类被加上）');
+
+  /* ── ④ 结算入账 ── */
+  const gain = D.G.coins;
+  D.G.hp = -1;                          // 直接走真实的 hp<=0 → endGame(false) 失败分支
+  let f = 0;
+  while (f < 240 && hidden(env.w, 'result')) { env.step(1, 16.67); f++; }
+  ok(!hidden(env.w, 'result'), '血量清零后进入结算');
+  ok(txt(env.w, 'resTitle') === '失败', '走的是失败分支：' + txt(env.w, 'resTitle'));
+  ok(txt(env.w, 'resCoinGain') === '+' + gain, '结算页显示本局金币 +' + gain + '：' + txt(env.w, 'resCoinGain'));
+  ok(D.profile.coins === gain, '结算后余额 = 本局金币（' + D.profile.coins + '）');
+  ok(D.profile.earned === gain, '累计收入同步累加（' + D.profile.earned + '）');
+  ok(D.profile.runs === 1, '存档记了 1 局（' + D.profile.runs + '）');
+  ok(txt(env.w, 'resCoinBal').indexOf(String(gain)) >= 0 && txt(env.w, 'resCoinBal').indexOf('通关奖励') < 0,
+    '失败局显示余额、不显示通关奖励：' + txt(env.w, 'resCoinBal'));
+
+  /* ── ⑤ 幂等：同一笔钱不许记两遍 ── */
+  D.bankRun(); D.bankRun();
+  ok(D.profile.coins === gain && D.profile.runs === 1,
+    '重复调用入账无效（幂等）：余额仍 ' + D.profile.coins + '，局数仍 ' + D.profile.runs);
+
+  env.w.document.getElementById('btnResHome').click();
+  ok(!hidden(env.w, 'home') && hidden(env.w, 'result'), '结算 → 返回主页正常');
+  ok(D.profile.coins === gain, '「结算 → 返回主页」不会把同一笔钱记两遍（仍 ' + D.profile.coins + '）');
+  ok(txt(env.w, 'homeCoins') === String(gain), '主页顶部显示当前金币：' + txt(env.w, 'homeCoins'));
+
+  /* ── ⑥ 中途退出也入账（击杀是真实发生的，没有作弊空间）── */
+  env.w.document.getElementById('btnStart').click();
+  D.G.coins = 33; D.G.coinGain = 1;
+  env.w.document.getElementById('btnSettingsInGame').click();
+  env.w.document.getElementById('btnBackHome').click();
+  ok(D.profile.coins === gain + 33, '中途返回主页，本局已挣的照样入账（' + D.profile.coins + '）');
+  ok(D.profile.runs === 2, '中途退出也记一局（' + D.profile.runs + '）');
+
+  /* ── ⑦ 从设置里「重新开始」：先把旧局的钱记上，再开新局 ──
+   * 顺序反了的话 newGame() 会把 G 整个换掉，那笔钱就再也拿不到了。 */
+  const beforeRestart = D.profile.coins, runs0 = D.profile.runs;
+  env.w.document.getElementById('btnStart').click();
+  D.G.coins = 7; D.G.coinGain = 1;
+  env.w.document.getElementById('btnSettingsInGame').click();
+  env.w.document.getElementById('btnRestart').click();
+  ok(D.profile.coins === beforeRestart + 7,
+    '「重新开始」先把上一局的 7 枚入账（' + beforeRestart + ' → ' + D.profile.coins + '）');
+  ok(D.G.coins === 0 && D.profile.runs === runs0 + 1, '新一局金币归零、局数 +1');
+
+  /* ── ⑧ 通关奖励必须有 ── */
+  ok(/coinBonusWin:\s*\d+/.test(raw), 'CFG 里有通关奖励 coinBonusWin');
+  ok(CFG.coinBonusWin > 0 && CFG.coinBonusWin < MON.elite.coin * 40,
+    '通关奖励 ' + CFG.coinBonusWin + ' 金币是个"多打几成"的量级（不是一局暴富）');
+
+  env.w.close();
+
+  /* ── ⑨ 存档逐字段校验：坏存档不许把玩家锁死或弄白屏 ── */
+  const env2 = makeEnv();
+  env2.w.localStorage.setItem('rd_profile', JSON.stringify({
+    coins: 1234.7, earned: -5, runs: 'not-a-number',
+    ownedMaps: ['不存在的地图'], map: 'day',
+    ownedSkins: ['greek', 'wuxia', '怪皮肤'], skin: '怪皮肤',
+    gender: '外星'
+  }));
+  loadScripts(env2.w);
+  await waitHome(env2);
+  const P2 = env2.w.RD.profile;
+  ok(!hidden(env2.w, 'home'), '存档被改坏也照样进主页（不会白屏）');
+  ok(P2.coins === 1234, '余额向下取整：1234.7 → ' + P2.coins);
+  ok(P2.earned === 0 && P2.runs === 0, '非法 earned/runs 被丢弃（' + P2.earned + ' / ' + P2.runs + '）');
+  ok(P2.ownedMaps.indexOf('不存在的地图') < 0 && P2.ownedMaps.indexOf('night') >= 0,
+    '未知地图 key 被过滤，初始地图强制补回：' + JSON.stringify(P2.ownedMaps));
+  ok(P2.map === 'night', '装备位指向"没买过的地图"时回落到初始款：' + P2.map);
+  ok(P2.ownedSkins.indexOf('怪皮肤') < 0 && P2.ownedSkins.length === 2,
+    '未知皮肤 key 被过滤，合法的保留：' + JSON.stringify(P2.ownedSkins));
+  ok(P2.skin === 'wuxia', '皮肤位回落到初始款：' + P2.skin);
+  ok(P2.gender === 'male', '非法性别回落到 male：' + P2.gender);
+  ok(txt(env2.w, 'homeCoins') === '1234', '主页显示校验后的余额：' + txt(env2.w, 'homeCoins'));
+  env2.w.close();
+}
+
+/* ═══════════════ 测试 L：商城（筛选 / 预览 / 购买 / 装备 / 性别 / 三张地图） ═══════════════
+ * 商城错起来最贵的地方不是"按钮不好看"，而是：扣了钱没到手、没扣钱却到手、
+ * 买了地图之后回不去夜景、存档坏了开不出商城。
+ * 所以这一组全部走**真实 DOM 点击**，不直接调内部函数去"演"一遍。
+ */
+async function testL() {
+  console.log('\n=== 测试 L：商城 ===');
+  const env = makeEnv();
+  env.w.Math.random = seeded(5150);
+  loadScripts(env.w);
+  await waitHome(env);
+  const D = env.w.RD, MAPS = D.MAPS, SKINS = D.SKINS;
+
+  /* ── ① 价格：初始款免费，地图贵过皮肤一大档 ──
+   * 基线来自 dev/economy.js 的实测（同一套机器人走位政策，同一批种子）：
+   *   最快 —— 会躲且通关：掉落 521 + 通关奖励 120 = 641 金币/局
+   *   不擅走位（会被追到墙边变靶子）：227 + 120 = 347 金币/局
+   * 定价检查**用最快那一档**：连最顺的人都要打这么多局，慢的只会更久。
+   * 这两个数写在这里是故意的 —— 改价之后如果不再满足"10 多局往上"，
+   * 这里会拦下来，而不是等到玩家抱怨太便宜。
+   * ⚠ 别用"掉落 521"当基线：那是扣掉通关奖励的数，玩家钱包里没有"扣掉"这一说。 */
+  const RUN_BEST = 641, RUN_TYPICAL = 347;
+  const freeMaps = MAPS.filter((m) => m.price === 0);
+  const freeSkins = SKINS.filter((s) => s.price === 0);
+  ok(freeMaps.length === 1 && freeMaps[0].key === 'night', '只有初始地图免费：' + freeMaps.map((m) => m.key).join(','));
+  ok(freeSkins.length === 1 && freeSkins[0].key === 'wuxia', '只有初始皮肤免费：' + freeSkins.map((s) => s.key).join(','));
+
+  const paidMaps = MAPS.filter((m) => m.price > 0).map((m) => m.price);
+  const paidSkins = SKINS.filter((s) => s.price > 0).map((s) => s.price);
+  const minMap = Math.min.apply(null, paidMaps), maxMap = Math.max.apply(null, paidMaps);
+  const maxSkin = Math.max.apply(null, paidSkins);
+  ok(minMap > maxSkin, '最便宜的地图 (' + minMap + ') 也贵过最贵的皮肤 (' + maxSkin + ') —— 「地图可以贵一点」');
+  ok(minMap / RUN_BEST >= 10, '最便宜的地图 ≈ ' + (minMap / RUN_BEST).toFixed(1) + ' 局（最快基线 ' +
+    RUN_BEST + '/局）≥ 10 局 —— 「10 多局金币的价格往上」');
+  ok(maxMap / RUN_BEST < 20, '最贵的地图 ≈ ' + (maxMap / RUN_BEST).toFixed(1) + ' 局（最快基线）< 20，没贵到劝退');
+  ok(minMap / RUN_TYPICAL >= 15, '对不擅走位的玩家（' + RUN_TYPICAL + '/局）最便宜的地图也要 ' +
+    (minMap / RUN_TYPICAL).toFixed(1) + ' 局 —— 是个"值得攒"的目标');
+  paidSkins.forEach((p) => ok(p / RUN_BEST < 6, p + ' 金币的皮肤 ≈ ' + (p / RUN_BEST).toFixed(1) +
+    ' 局（最快基线）< 6 局，比地图早拿到'));
+
+  /* ── ② 每款皮肤都得有男款女款，而且真的不一样 ── */
+  let dupGender = null, sameBody = null;
+  SKINS.forEach((s) => {
+    if (!s.male || !s.female) { dupGender = s.key; return; }
+    if (s.male.hair === s.female.hair && s.male.shK === s.female.shK && s.male.hipK === s.female.hipK) sameBody = s.key;
+  });
+  ok(!dupGender, '每款皮肤都有男款与女款两套体型参数' + (dupGender ? '（' + dupGender + ' 缺一套）' : ''));
+  ok(!sameBody, '男女款参数确实不同（不是复制了一份' + (sameBody ? '：' + sameBody : '') + '）');
+
+  /* ── ③ 主题 / 地图：夜图色值必须与抽主题前逐字一致 ── */
+  const night = D.theme('night');
+  ok(night.road[1] === '#232833' && night.sky[0] === '#080d18' && night.curb === '120,190,255',
+    '夜图路面色 = 改动前的原值（road[1]=' + night.road[1] + '，sky[0]=' + night.sky[0] + '，curb=' + night.curb + '）');
+  ok(night.fogMin === 0.30 && night.fogD === 75 && night.vig === 0.55 && night.flies === 14,
+    '夜图的雾/暗角/萤火参数也没漂（fogMin=' + night.fogMin + '，fogD=' + night.fogD +
+    '，vig=' + night.vig + '，flies=' + night.flies + '）');
+  ok(D.theme('day').sky[0] === '#3f7fc4' && D.theme('day').fogD === 95 && D.theme('day').flies === 0,
+    '白昼图有自己的天空、雾参数与"没有萤火"');
+  ok(D.theme('desert').sky[0] === '#33406f' && D.theme('desert').flies === 9,
+    '沙漠图有自己的天空与浮尘数量');
+
+  /* deepMerge 的意义就在这里：地图只覆盖部分色值，
+   * 用"整块替换"的话 BASE_THEME 里没被覆盖的字段会变成 undefined ——
+   * 那种崩溃只在切到那张地图时出现，最难查。 */
+  const baseP = Object.keys(night.P);
+  MAPS.forEach((m) => {
+    const th = D.theme(m.key);
+    const missP = baseP.filter((k) => th.P[k] === undefined);
+    ok(missP.length === 0, '[' + m.key + '] 景物配色没有缺项' +
+      (missP.length ? '（缺 ' + missP.join(',') + ' → 切过去就画不出来）' : ''));
+    const lp = th.lamp;
+    ok(lp && lp.glow && lp.glow.length === 3 && lp.light && lp.light.length === 3 && typeof lp.poolA === 'number',
+      '[' + m.key + '] 灯笼的三档色标与光池齐全（白天是"不点灯"，但仍然要有值）');
+    const missTop = ['sky', 'ground', 'ridge', 'treeLine', 'haze', 'road', 'verge'].filter((k) => th[k] === undefined);
+    ok(missTop.length === 0, '[' + m.key + '] 顶层主题字段齐全' + (missTop.length ? '（缺 ' + missTop.join(',') + '）' : ''));
+  });
+
+  /* ── ④ 玩法性的颜色故意不进主题：换地图必须一模一样 ──
+   * "哪个圈是要命的"得跨地图通用，否则换张图要重新学一遍 —— 那不是美术，是 bug。
+   * 用静态契约查：MONSTERS 的定义块里不许出现 theme( —— 出现了就说明妖物颜色会随地图变。 */
+  const rawSrc = fs.readFileSync(path.join(DIR, 'game.js'), 'utf8');
+  const iM = rawSrc.indexOf('var MONSTERS');
+  const monBlock = rawSrc.slice(iM, rawSrc.indexOf('};', iM) + 2);
+  ok(iM > 0 && monBlock.length > 200, '能定位到 MONSTERS 的定义块');
+  ok(monBlock.indexOf('theme(') < 0, '妖物的颜色不读主题（换地图妖物长得一样，预警圈也是同一个）');
+
+  /* ── ⑤ 筛选器 ── */
+  env.w.document.getElementById('btnShop').click();
+  ok(!hidden(env.w, 'shop') && hidden(env.w, 'home'), '主页点「商城」进入商城');
+
+  const cardCount = () => env.w.document.querySelectorAll('#shopGrid .card').length;
+  const tabEl = (t) => env.w.document.querySelector('#shopTabs [data-tab="' + t + '"]');
+  ok(env.w.document.querySelectorAll('#shopTabs [data-tab]').length === 3,
+    '有 3 个筛选项：' + Array.from(env.w.document.querySelectorAll('#shopTabs [data-tab]'))
+      .map((b) => b.textContent).join(' / '));
+  ok(cardCount() === MAPS.length + SKINS.length, '默认「全部」列出所有商品（' + cardCount() + ' 张卡）');
+
+  tabEl('map').click();
+  ok(cardCount() === MAPS.length, '点「地图」只剩 ' + cardCount() + ' 张卡（= ' + MAPS.length + ' 张地图）');
+  ok(hidden(env.w, 'genderRow'), '地图页隐藏性别开关（免得让人以为地图也分男女）');
+  ok(D.shop.items().every((i) => i.kind === 'map'), '地图筛选下没有混进皮肤');
+
+  tabEl('skin').click();
+  ok(cardCount() === SKINS.length, '点「皮肤」只剩 ' + cardCount() + ' 张卡（= ' + SKINS.length + ' 款皮肤）');
+  ok(!hidden(env.w, 'genderRow'), '皮肤页才出现性别开关');
+  ok(D.shop.items().every((i) => i.kind === 'skin'), '皮肤筛选下没有混进地图');
+  ok(cardCount() === env.w.document.querySelectorAll('#shopGrid .thumbcv').length,
+    '每张卡都有自己的预览画布');
+
+  /* ── ⑥ 初始款的呈现（这是用户专门追问过的一点）── */
+  const cardOf = (key) => env.w.document.querySelector('#shopGrid [data-key="' + key + '"]').closest('.card');
+  const tagOf = (key) => { const t = cardOf(key).querySelector('.tag'); return t ? t.textContent : ''; };
+  const footOf = (key) => cardOf(key).querySelector('.cfoot').textContent;
+
+  ok(tagOf('wuxia') === '使用中', '正用着的初始皮肤标「使用中」：' + tagOf('wuxia'));
+  ok(cardOf('wuxia').querySelector('[data-act="buy"]') === null, '初始皮肤卡片上没有购买按钮（不售卖）');
+  ok(footOf('wuxia').indexOf('购买') < 0, '初始皮肤也不显示价格：' + footOf('wuxia'));
+
+  /* ── ⑦ 买地图：走真实的"点购买 → 二次确认 → 确认扣款" ── */
+  tabEl('map').click();                 // 上一步停在皮肤页，买地图得先切回地图页
+  const dayKey = MAPS.filter((m) => m.price > 0)[0].key;
+  const dayPrice = MAPS.filter((m) => m.price > 0)[0].price;
+  ok(cardOf(dayKey) !== null, '切到地图页后能看到 ' + dayKey + ' 的卡片');
+  D.profile.coins = dayPrice; D.shop.paint();
+  ok(!!cardOf(dayKey).querySelector('[data-act="buy"]'), '余额够时地图卡上有「购买」按钮');
+  ok(cardOf(dayKey).querySelector('.cprice').textContent.indexOf(String(dayPrice)) >= 0,
+    '卡片上写清了价格：' + cardOf(dayKey).querySelector('.cprice').textContent);
+
+  cardOf(dayKey).querySelector('[data-act="buy"]').click();
+  ok(!hidden(env.w, 'buyConfirm'), '点「购买」先弹二次确认，不是点了就扣钱');
+  ok(txt(env.w, 'bcPrice') === dayPrice + ' 金币', '确认层写清价格：' + txt(env.w, 'bcPrice'));
+  ok(txt(env.w, 'bcSub').indexOf('购买后剩余 0') >= 0, '确认层写了买完剩多少：' + txt(env.w, 'bcSub').replace(/\s+/g, ' '));
+  ok(!env.w.document.getElementById('bcOk').disabled, '余额够 → 确认按钮可点');
+
+  env.w.document.getElementById('bcOk').click();
+  ok(hidden(env.w, 'buyConfirm'), '确认后弹层关闭');
+  ok(D.profile.coins === 0, '扣款正确：' + dayPrice + ' → ' + D.profile.coins);
+  ok(D.shop.owns('map', dayKey), '已拥有 ' + dayKey);
+  ok(D.profile.map === dayKey, '买完直接装备（不用再点一次「使用」）：' + D.profile.map);
+  ok(cardOf(dayKey).classList.contains('using'), '刚买的卡片变成「使用中」');
+  ok(txt(env.w, 'shopCoins') === '0', '商城顶部余额同步：' + txt(env.w, 'shopCoins'));
+
+  /* ── ⑧ 初始地图：不售卖、不标"已拥有"、但永远留着入口 ── */
+  ok(tagOf('night') === '初始', '换成别的图后，初始图标签是「初始」而不是「已拥有」：' + tagOf('night'));
+  ok(footOf('night').indexOf('初始赠送') >= 0, '初始图写「初始赠送」：' + footOf('night'));
+  ok(cardOf('night').querySelector('[data-act="buy"]') === null, '初始图没有购买按钮');
+  ok(cardOf('night').querySelector('[data-act="equip"]') !== null,
+    '初始图永远留着「使用」入口 —— 否则买了新地图就再也换不回夜景了');
+
+  /* ── ⑨ 余额不足：能点、但点不动 ── */
+  const desKey = MAPS.filter((m) => m.price > 0)[1].key;
+  const desPrice = MAPS.filter((m) => m.price > 0)[1].price;
+  D.profile.coins = 100; D.shop.paint();
+  ok(cardOf(desKey).querySelector('.cprice').classList.contains('poor'),
+    '钱不够时价格标成红色（.poor）');
+  cardOf(desKey).querySelector('[data-act="buy"]').click();
+  ok(txt(env.w, 'bcSub').indexOf('还差 ' + (desPrice - 100)) >= 0,
+    '确认层提示还差多少：' + txt(env.w, 'bcSub').replace(/\s+/g, ' '));
+  ok(env.w.document.getElementById('bcOk').disabled, '余额不足 → 确认按钮禁用');
+  ok(txt(env.w, 'bcOk') === '金币不足', '按钮文案改成「金币不足」：' + txt(env.w, 'bcOk'));
+  env.w.document.getElementById('bcOk').click();
+  ok(D.profile.coins === 100 && !D.shop.owns('map', desKey),
+    '禁用状态下点不动：钱没少（' + D.profile.coins + '），东西也没到手');
+  env.w.document.getElementById('bcCancel').click();
+  ok(hidden(env.w, 'buyConfirm'), '取消能关掉弹层');
+
+  /* ── ⑩ 没买的东西装备不上；已买的能来回切 ── */
+  ok(D.shop.equip('map', desKey) === false && D.profile.map === dayKey,
+    '没买过的地图装备不上（equip 返回 false，装备位不变）');
+  cardOf('night').querySelector('[data-act="equip"]').click();
+  ok(D.profile.map === 'night', '点「使用」能切回初始地图：' + D.profile.map);
+  ok(D.shop.owns('map', dayKey), '切回初始图不会丢掉买过的图：' + JSON.stringify(D.profile.ownedMaps));
+
+  /* ── ⑪ 缩略图真的走了渲染管线（不是一块纯色）── */
+  const beforeTheme = D.theme();
+  const rec = (kind, key, gender) => {
+    if (gender) D.shop.setGender(gender);
+    const c = fakeCanvas(132, 168);
+    D.shop.renderThumb(c, kind, key);
+    return c;
+  };
+  const cDes = rec('map', desKey);
+  ok(cDes.calls.length > 50, '沙漠缩略图产生了 ' + cDes.calls.length + ' 次绘制调用（真的跑了 sky/road/scenery）');
+  ok(cDes.calls.filter((s) => s.indexOf('fillStyle=') === 0).length > 5,
+    '缩略图用了 ' + cDes.calls.filter((s) => s.indexOf('fillStyle=') === 0).length + ' 种填充色，不是一块纯色');
+  ok(D.theme() === beforeTheme, '画完「别的」地图的缩略图后，当前装备的主题没被换掉（withTarget 还原了）');
+
+  let thumbErr = null;
+  MAPS.forEach((m) => {
+    try { rec('map', m.key); } catch (e) { thumbErr = m.name + '：' + e.message; }
+  });
+  ok(!thumbErr, '三张地图的缩略图都画得出来' + (thumbErr ? '（' + thumbErr + '）' : ''));
+
+  /* 皮肤立绘：14 种组合都要画得出来，而且男女款画出来的几何必须不一样 ——
+   * "只有男女两个开关、皮肤本身不变"这件事，最终就体现在这里。 */
+  let poseErr = null;
+  SKINS.forEach((s) => ['male', 'female'].forEach((g) => {
+    try { rec('skin', s.key, g); } catch (e) { poseErr = s.key + '/' + g + '：' + e.message; }
+  }));
+  ok(!poseErr, SKINS.length + ' 款皮肤 × 男女 = ' + (SKINS.length * 2) + ' 张立绘全部画得出来' +
+    (poseErr ? '（' + poseErr + '）' : ''));
+
+  const maleSig = rec('skin', 'wuxia', 'male').calls.join('|');
+  const femSig = rec('skin', 'wuxia', 'female').calls.join('|');
+  ok(maleSig !== femSig, '同一款皮肤换成女款，画出来的几何不一样（不是只换了个颜色）');
+  ok(maleSig.split('|').length > 35, '立绘的绘制调用有 ' + maleSig.split('|').length + ' 次，是一整套人物');
+  ok(rec('skin', 'wuxia', 'male').calls.join('|') === maleSig, '同一性别两次渲染逐条一致（没掺随机或时间）');
+
+  /* 调试钩子自己也得是能用的：RD.shop 里曾同时挂了 tab(t) 和 get tab()，
+   * 对象字面量同名键后者胜 —— 函数被 getter 覆盖成字符串，调用时静默失效。 */
+  ok(typeof D.shop.tab === 'function', 'RD.shop.tab 是可调用的切页函数（没被同名 getter 覆盖）');
+  D.shop.tab('map');
+  ok(D.shop.currentTab === 'map' && cardCount() === MAPS.length,
+    'RD.shop.tab("map") 真的切了页：' + D.shop.currentTab + '，' + cardCount() + ' 张卡');
+
+  /* ── ⑫ 性别开关：切换时皮肤与已拥有清单一点不动 ── */
+  D.shop.setGender('male');
+  D.shop.tab('skin');
+  const segs = env.w.document.querySelectorAll('#genderSeg [data-gender]');
+  ok(segs.length === 2, '性别开关有两档：' + Array.from(segs).map((b) => b.textContent).join(' / '));
+  const skin0 = D.profile.skin, owned0 = D.profile.ownedSkins.join(',');
+  env.w.document.querySelector('#genderSeg [data-gender="female"]').click();
+  ok(D.profile.gender === 'female', '点「女款」生效');
+  ok(D.profile.skin === skin0 && D.profile.ownedSkins.join(',') === owned0,
+    '切性别不改皮肤（皮肤仍 ' + D.profile.skin + '，已拥有 ' + D.profile.ownedSkins.join('/') + '）');
+  ok(env.w.document.querySelector('#genderSeg [data-gender="female"]').classList.contains('on'),
+    '女款档位高亮');
+  env.w.document.querySelector('#genderSeg [data-gender="male"]').click();
+  ok(D.profile.gender === 'male' && D.profile.skin === skin0, '切回男款同样不动皮肤');
+
+  /* ── ⑬ 买皮肤 ── */
+  D.profile.coins = 900; D.shop.paint();
+  const greekKey = SKINS.filter((s) => s.price === 900)[0].key;
+  cardOf(greekKey).querySelector('[data-act="buy"]').click();
+  env.w.document.getElementById('bcOk').click();
+  ok(D.profile.coins === 0 && D.profile.skin === greekKey,
+    '买皮肤并自动装备（余额 ' + D.profile.coins + '，皮肤 ' + D.profile.skin + '）');
+  ok(D.shop.owns('skin', greekKey) && !D.shop.owns('skin', 'persian'), '只解锁买下的那一款');
+  ok(D.profile.gender === 'male', '买皮肤不会顺手改性别：' + D.profile.gender);
+
+  /* ── ⑭ 存档：写盘 + "刷新页面"后还在 ── */
+  const savedRaw = env.w.localStorage.getItem('rd_profile');
+  ok(!!savedRaw, '商城操作写了存档 rd_profile');
+  const savedP = JSON.parse(savedRaw);
+  ok(savedP.coins === 0 && savedP.ownedMaps.indexOf(dayKey) >= 0 &&
+    savedP.ownedSkins.indexOf(greekKey) >= 0 && savedP.skin === greekKey,
+    '存档内容对得上：' + JSON.stringify(savedP));
+
+  env.w.document.getElementById('btnShopBack').click();
+  ok(!hidden(env.w, 'home') && hidden(env.w, 'shop'), '返回按钮回到主页');
+  ok(txt(env.w, 'homeCoins') === String(D.profile.coins), '主页金币与存档一致：' + txt(env.w, 'homeCoins'));
+
+  const env3 = makeEnv();
+  env3.w.localStorage.setItem('rd_profile', savedRaw);
+  loadScripts(env3.w);
+  await waitHome(env3);
+  const P3 = env3.w.RD.profile;
+  ok(P3.ownedMaps.indexOf(dayKey) >= 0 && P3.ownedSkins.indexOf(greekKey) >= 0 &&
+    P3.skin === greekKey && P3.map === 'night',
+    '「刷新页面」后买过的地图与皮肤都还在（地图 ' + P3.map + '，皮肤 ' + P3.skin + '）');
+  ok(txt(env3.w, 'homeCoins') === String(P3.coins), '刷新后主页余额照旧：' + txt(env3.w, 'homeCoins'));
+
+  env3.w.close();
+  env.w.close();
+}
+
+/* 记录型 2D 上下文：把每一次绘制调用记下来。
+ * 用它回答两个问题："这张缩略图到底画了东西没有"、"男女款画出来是不是同一张"。
+ * 断言的是**调用序列**而不是像素 —— 像素受 DPR、字体、抗锯齿影响，调用序列不会。 */
+function fakeCanvas(w, h) {
+  const calls = [];
+  const grad = { addColorStop() {} };
+  const target = {
+    calls,
+    createLinearGradient: () => grad,
+    createRadialGradient: () => grad,
+    measureText: () => ({ width: 0 })
+  };
+  const ctx = new Proxy(target, {
+    get(t, k) {
+      if (k in t) return t[k];
+      return function () {
+        const a = Array.prototype.slice.call(arguments)
+          .map((v) => (typeof v === 'number' ? v.toFixed(2) : String(v)));
+        calls.push(k + '(' + a.join(',') + ')');
+      };
+    },
+    set(t, k, v) { calls.push(k + '=' + v); t[k] = v; return true; }
+  });
+  return { width: w, height: h, calls, getContext: () => ctx };
+}
+
 (async function () {
   try {
     await testA();
@@ -1053,6 +1564,8 @@ async function testJ() {
     await testH();
     await testI();
     await testJ();
+    await testK();
+    await testL();
   } catch (e) {
     fail++;
     console.log('  [ERROR] ' + (e && e.stack ? e.stack.split('\n').slice(0, 4).join('\n') : e));

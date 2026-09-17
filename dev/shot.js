@@ -44,8 +44,28 @@ const DPR = dprArg ? Math.max(1, Math.min(3, parseInt(dprArg.slice(6), 10) || 1)
  * 默认 twin 是历史原因（HUD 截图的落点），拍齐射弹道时要显式指定。 */
 const weaponArg = process.argv.find((a) => a.startsWith('--weapon='));
 const WEAPON = weaponArg ? weaponArg.slice(9) : 'twin';
+/* --map=day / --skin=greek / --gender=female：直接改存档里的"当前装备"再截图。
+ * 加地图/皮肤时，"这张图长什么样"必须能一眼看到，否则只能靠想象。
+ * --shop=all|map|skin：不开局，直接进商城拍商品卡（缩略图就是真实渲染管线画的，
+ * 所以这一张图等于把所有地图/皮肤都过了一遍）。 */
+const MAP_ARG = (process.argv.find((a) => a.startsWith('--map=')) || '').slice(6);
+const SKIN_ARG = (process.argv.find((a) => a.startsWith('--skin=')) || '').slice(7);
+const GENDER_ARG = (process.argv.find((a) => a.startsWith('--gender=')) || '').slice(9);
+const SHOP_ARG = (process.argv.find((a) => a.startsWith('--shop=')) || '').slice(7);
+/* --coins=9000：给存档塞一笔钱再截图。
+ * 没有它的话商城永远显示"余额 0"，所有价格都是红的（.poor）——
+ * 而"买得起"和"买不起"是两种完全不同的卡片状态（价格色 + 按钮文案），
+ * 只拍一种等于没验。 */
+const COINS_ARG = process.argv.find((a) => a.startsWith('--coins='));
+const COINS = COINS_ARG ? Math.max(0, parseInt(COINS_ARG.slice(8), 10) || 0) : null;
 const SEED = 20260916;
 const PORT = 9223;
+/* --probe=<js>：在页面里求值一句话，把结果打到终端。
+ * 截图只能告诉你"看起来不对"，看不出**为什么**不对 ——
+ * 卡片文字整块不见了这种事，得去读真实 DOM 的 getBoundingClientRect / getComputedStyle。
+ * 页面此时已经跑完注入脚本（该开的局、该进的商城都已经在状态里），
+ * 所以这里可以直接量任何元素。 */
+const PROBE = (process.argv.find((a) => a.startsWith('--probe=')) || '').slice(8);
 
 /* 钉住的场景：妖物绝不越过玩家，构图每次一致。
  * 深度 17~86 米 → 覆盖"快到跟前 / 中景 / 远景"三档，正好能看出
@@ -67,6 +87,11 @@ const inject = `
   var OPEN = ${process.argv.includes('--stats') ? 'true' : 'false'};
   var WEAPON = ${JSON.stringify(WEAPON)};
   var WRAP = ${process.argv.includes('--wrap') ? 'true' : 'false'};
+  var SHOP = ${JSON.stringify(SHOP_ARG)};
+  var MAP = ${JSON.stringify(MAP_ARG)};
+  var SKIN = ${JSON.stringify(SKIN_ARG)};
+  var GENDER = ${JSON.stringify(GENDER_ARG)};
+  var COINS = ${COINS === null ? 'null' : COINS};
   var STAGE = ${JSON.stringify(STAGE)};
   var s = SEED >>> 0;
   Math.random = function () { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; };
@@ -87,10 +112,40 @@ const inject = `
     };
   }
 
+  /* 换装备：直接改存档里的当前装备。theme() 每次绘制都现读 profile.map，
+   * 所以改完立刻生效；但暗角的渐变对象是按地图缓存的，得发一次 resize 让它重建。 */
+  function applyEquip() {
+    var D = window.RD;
+    if (!D || !D.profile) return;
+    if (MAP && D.profile.map !== MAP) {
+      D.profile.map = MAP;
+      window.dispatchEvent(new Event('resize'));
+    }
+    if (SKIN) D.profile.skin = SKIN;
+    if (GENDER) D.profile.gender = GENDER;
+    if (COINS !== null) {
+      D.profile.coins = COINS;
+      D.profile.earned = COINS;
+      if (D.updateCoinDisplays) D.updateCoinDisplays();
+      if (D.saveProfile) D.saveProfile();
+    }
+  }
+
   function tryStart() {
     var home = document.getElementById('home');
     var btn = document.getElementById('btnStart');
     if (!home || !btn || home.classList.contains('hidden')) { setTimeout(tryStart, 40); return; }
+    applyEquip();
+    if (SHOP) {
+      /* 不开局，直接进商城：商品卡的缩略图就是真实渲染管线画的，
+       * 所以这一张截图等于把所有地图/皮肤都看了一遍。 */
+      var shopBtn = document.getElementById('btnShop');
+      if (shopBtn) shopBtn.click();
+      var tab = document.querySelector('#shopTabs [data-tab="' +
+        (SHOP === 'map' ? 'map' : SHOP === 'skin' ? 'skin' : 'all') + '"]');
+      if (tab) tab.click();
+      return;
+    }
     if (HOME) return;                 // --home：停在主界面，拍首页背景
     btn.click();
     stage();
@@ -261,6 +316,20 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     console.log('probe: ' + JSON.stringify(probe.result));
     console.log('events: ' + events.join(','));
     if (logs.length) console.log('page logs:\n  ' + logs.join('\n  '));
+
+    if (PROBE) {
+      /* awaitPromise：探针可以返回 Promise，于是能"先造一个状态、等它演完再看"。
+       * 例：把玩家打死 → await 600ms 让结算页真的出现 → 再截图。
+       * 少了这一条，返回 Promise 会被当成普通对象，什么都不会等。 */
+      const r = await send('Runtime.evaluate', {
+        expression: PROBE, returnByValue: true, awaitPromise: true
+      });
+      if (r.result && r.result.exceptionDetails) {
+        console.log('probe(--probe) 抛错: ' + JSON.stringify(r.result.exceptionDetails));
+      } else {
+        console.log('--probe → ' + JSON.stringify(r.result && r.result.result ? r.result.result.value : r, null, 2));
+      }
+    }
 
     /* --noscenery：把装饰整体关掉，用来量"装饰到底花了多少"。
      * 直接改 RD.SCENE 就行 —— 场景是按世界里程即时推导的，没有缓存状态。 */
