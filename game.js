@@ -1068,28 +1068,98 @@
       }
     }
 
-    // 路沿
-    ctx.strokeStyle = 'rgba(120,190,255,0.5)';
-    ctx.lineWidth = 3;
-    ctx.beginPath();
-    ctx.moveTo(road.left0.x, road.left0.y);
-    ctx.lineTo(far.a.x, far.a.y);
-    ctx.stroke();
-    ctx.beginPath();
-    ctx.moveTo(road.right0.x, road.right0.y);
-    ctx.lineTo(far.b.x, far.b.y);
-    ctx.stroke();
+    drawCurb();
+  }
 
-    ctx.strokeStyle = 'rgba(120,190,255,0.16)';
-    ctx.lineWidth = 8;
-    ctx.beginPath();
-    ctx.moveTo(road.left0.x, road.left0.y);
-    ctx.lineTo(far.a.x, far.a.y);
-    ctx.stroke();
-    ctx.beginPath();
-    ctx.moveTo(road.right0.x, road.right0.y);
-    ctx.lineTo(far.b.x, far.b.y);
-    ctx.stroke();
+  /* ══════════════════ 路沿 ══════════════════
+   * 一条发光的边条，负责在暗路面上划出路界。
+   *
+   * ⚠️ 线宽必须是「世界量」，不能写成固定屏幕像素。
+   *    第一版是 ctx.lineWidth = 3 + 8px 辉光，从近端一路 stroke 到消失点。
+   *    问题在于路宽是按 (1−t) 收缩到 0 的，而线宽固定 ——
+   *    「路沿宽 ÷ 路宽」这个比值于是随距离失控：
+   *    22 米处 1.2%、193 米处 10.1%、414 米处 23.1%（实测数据见 dev/curbdiag.js），
+   *    屏幕上就是「远处的路沿比整条路还宽」。
+   *
+   *    而且 alpha 恒定 0.5：远处路面已经暗到 rgb(31,32,36)，路沿照旧，
+   *    明暗差反而从 62 涨到 80 个亮度级 —— 所以还「又亮」。
+   *
+   *    改成 wM（米）之后，「路沿宽 ÷ 路宽」恒等于 wM ÷ roadWidth = 1.2%，
+   *    与深度无关，也与屏幕宽度无关（和景物、妖物一样，宽度天然跟着透视走）。
+   *
+   * ⚠️ 必须用「米」，连「3px」这种看着人畜无害的固定值也不行：
+   *    它只是**碰巧**在 480px 宽的窗口里比例对；换成 1920px 的桌面全屏，
+   *    同样的 3px 相对路宽只剩 0.3%，路沿会淡到看不见 —— 那是另一个 bug。
+   *
+   *    宽度掉到 minW 以下直接不画 —— 路沿在 260 米开外自然消失，
+   *    而不是糊成一条亚像素灰线。
+   *
+   * ⚠️ 明度同理，走的是景物同一套空气透视：exp(−depth/fogD)。
+   *    近端 alpha 与改动前一致（0.55 ≈ 原来的 0.5），近处观感刻意不动 ——
+   *    用户报的是「远处」，就别顺手把没问题的地方也改了。
+   */
+  var CURB = {
+    wM: 0.048,      // 路沿宽度（米）—— 4.8 厘米，现实里一条路缘石的量级
+    glowK: 2.67,    // 辉光宽度 = 实边 × 该倍率（即改动前的 8px ÷ 3px）
+    minW: 0.45,     // 细于此就不再绘制（亚像素只会糊成灰线）
+    aNear: 0.55,    // 近端不透明度
+    glowA: 0.16,    // 辉光不透明度
+    fogD: 110,      // 空气透视特征距离（米）
+    segs: 36
+  };
+
+  /* 路沿几何：枚举与绘制分离（和 sceneItems 一个路子）。
+   * 自动化测试可以直接拿到每段的宽度/透明度来断言比值恒定，
+   * 不必去解码像素、也不必去数 stroke 调用次数。
+   * 返回每段：{ a0,a1,b0,b1（左右两条边的起止点）, w, roadW, alpha, depth } */
+  function curbSegments() {
+    var out = [];
+    var tEnd = 0.995;                      // 与路面主体的远端一致，长度不会对不上
+    for (var i = 0; i < CURB.segs; i++) {
+      var t0 = (tEnd * i) / CURB.segs;
+      var t1 = (tEnd * (i + 1)) / CURB.segs;
+      var tm = (t0 + t1) / 2;
+      /* 宽度 = 世界宽度 × 该深度处的横向像素密度。
+       * pxPerMeter 是深度 0 处的密度，乘 (1−t) 就落到当前深度 ——
+       * 和 roadWidth 走的是同一个缩放，所以两者的比值恒定。 */
+      var w = CURB.wM * pxPerMeter * (1 - tm);
+      if (w < CURB.minW) break;            // 太细就别画了：远处路沿本来就该看不见
+      var c0 = road.crossSectionAtT(t0), c1 = road.crossSectionAtT(t1);
+      var depth = road.depthFromT(tm);
+      out.push({
+        a0: c0.a, a1: c1.a, b0: c0.b, b1: c1.b,
+        w: w, roadW: (c0.width + c1.width) / 2,
+        alpha: CURB.aNear * Math.exp(-depth / CURB.fogD),
+        depth: depth
+      });
+    }
+    return out;
+  }
+
+  /* 辉光层的宽度与不透明度都从主层按比例推出 ——
+   * 上一版辉光是写死的 8px，远端比主线（3px）还宽，
+   * 等于给「远处路沿又粗又亮」又加了一层。两处写死必然走样，这里只写一处。 */
+  var CURB_LAYERS = [
+    { k: 1, ak: 1 },                          // 实边
+    { k: CURB.glowK, ak: CURB.glowA / CURB.aNear }   // 辉光
+  ];
+
+  function drawCurb() {
+    var segs = curbSegments();
+    for (var L = 0; L < CURB_LAYERS.length; L++) {
+      var k = CURB_LAYERS[L].k, ak = CURB_LAYERS[L].ak;
+      for (var i = 0; i < segs.length; i++) {
+        var s = segs[i];
+        var a = s.alpha * ak;
+        if (a < 0.004) continue;              // 已经淡到看不见，别再花一次 stroke
+        ctx.strokeStyle = 'rgba(120,190,255,' + a.toFixed(3) + ')';
+        ctx.lineWidth = s.w * k;
+        ctx.beginPath();
+        ctx.moveTo(s.a0.x, s.a0.y); ctx.lineTo(s.a1.x, s.a1.y);
+        ctx.moveTo(s.b0.x, s.b0.y); ctx.lineTo(s.b1.x, s.b1.y);
+        ctx.stroke();
+      }
+    }
   }
 
   /* ══════════════════ 场景装饰 ══════════════════
@@ -2282,6 +2352,8 @@
     project: function (x, y) { return road.project(x, y); },
     /* 枚举当前视野里的景物（不绘制）。给自动化测试清点用。 */
     sceneItems: function (scroll, emit) { return sceneItems(scroll === undefined ? currentScroll() : scroll, emit); },
+    /* 路沿每段的几何与透明度（不绘制）。给测试断言"线宽随透视收缩、明度随距离衰减"用。 */
+    curbSegments: function () { return curbSegments(); },
     /* 属性面板：开关 + 当前那几行数据（测试直接核对数字，不用去解 DOM） */
     toggleStats: function (force) { toggleStats(force); },
     statsRows: function () { return G ? statsRows() : []; },

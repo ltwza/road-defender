@@ -957,6 +957,90 @@ async function testI() {
   env.w.close();
 }
 
+/* ═══════════════ 测试 J：路沿的宽度必须随透视收缩 ═══════════════
+ * 这一组钉的是「远处的路沿又粗又亮」。
+ *
+ * 病根很小：路沿用 ctx.lineWidth = 3（固定屏幕像素，外加 8px 辉光）
+ * 从近端一路 stroke 到消失点，而路宽是按 (1−t) 收缩到 0 的 ——
+ * 于是「路沿宽 ÷ 路宽」随距离失控：22 米处 1.2%、193 米处 10.1%、
+ * 414 米处 23.1%（dev/curbdiag.js 实测），屏幕上就是远处路沿比整条路还宽。
+ * 顺带 alpha 恒定 0.5，远处路面已经暗下去了路沿却不变，
+ * 明暗差反而从 62 涨到 80 个亮度级 —— 所以还「又亮」。
+ *
+ * 断言分两层，缺一不可：
+ *   · 比值恒定 + 单调不增 —— 钉住「别再用固定像素」；
+ *   · 末端深度够远 —— 钉住「别用截断冒充收缩」。
+ *     把路沿在 10 米处一砍，比值同样是恒定的，但那是把问题藏起来，不是修好。
+ */
+async function testJ() {
+  console.log('\n=== 测试 J：路沿线宽随透视收缩 ===');
+  const raw = fs.readFileSync(path.join(DIR, 'game.js'), 'utf8');
+
+  /* ── 静态契约 ── */
+  ok(/function curbSegments/.test(raw), '路沿几何抽成了 curbSegments()（枚举与绘制分离）');
+  ok(/wM\s*:\s*[\d.]+/.test(raw), '路沿宽度以「米」定义，而不是屏幕像素');
+  ok(/CURB\.wM\s*\*\s*pxPerMeter/.test(raw), '宽度按「米 × 该深度像素密度」换算');
+
+  /* 线宽必须在 drawCurb 的函数体里断言，不能拿整份源码去正则 ——
+   * game.js 里另有一处 ctx.lineWidth = 3（飘字的黑描边，那是正当的固定像素），
+   * 还有注解这次病根的注释文本，混在一起断言必然误报（第一版就误报了）。 */
+  const i0 = raw.indexOf('function drawCurb');
+  const i1 = raw.indexOf('\n  function ', i0 + 10);
+  const curbFn = i0 < 0 ? '' : raw.slice(i0, i1 > 0 ? i1 : i0 + 1500);
+  ok(curbFn.length > 100, '能定位到 drawCurb 的函数体');
+  ok(!/lineWidth\s*=\s*[\d.]/.test(curbFn), 'drawCurb 里没有写死的 lineWidth');
+  ok(/lineWidth\s*=\s*s\.w/.test(curbFn), 'drawCurb 的线宽来自该段算出来的宽度');
+
+  const env = makeEnv();
+  loadScripts(env.w);
+  const ready = await waitFor(() => env.w.RD && env.w.RD.curbSegments().length > 0);
+  ok(ready, 'boot 之后路沿几何可用');
+  if (!ready) { env.w.close(); return; }
+
+  const segs = env.w.RD.curbSegments();
+  ok(segs.length >= 20, '路沿分成足够多的段（' + segs.length + ' ≥ 20，否则收缩会成台阶）');
+
+  /* ── 比值恒定：这就是「世界量」的定义性质 ── */
+  const ratios = segs.map((s) => s.w / s.roadW);
+  const rMin = Math.min.apply(null, ratios), rMax = Math.max.apply(null, ratios);
+  ok(rMax / rMin < 1.02,
+    '「路沿宽 ÷ 路宽」全程恒定（' + rMin.toFixed(5) + ' ~ ' + rMax.toFixed(5) +
+    '，极差 ' + ((rMax / rMin - 1) * 100).toFixed(2) + '%）');
+
+  /* ── 单调：宽度和透明度都不能出现「越远越粗 / 越亮」 ── */
+  let wBad = 0, aBad = 0;
+  for (let i = 1; i < segs.length; i++) {
+    if (segs[i].w > segs[i - 1].w + 1e-9) wBad++;
+    if (segs[i].alpha > segs[i - 1].alpha + 1e-9) aBad++;
+  }
+  ok(wBad === 0, '线宽随深度单调不增（越远越细）');
+  ok(aBad === 0, '不透明度随深度单调不增（越远越淡）');
+
+  /* ── 明度衰减：远端必须「亮不起来」 ── */
+  const first = segs[0], last = segs[segs.length - 1];
+  ok(first.alpha > 0.45 && first.alpha < 0.65,
+    '近端不透明度保持原样（' + first.alpha.toFixed(3) + '，约合改动前的 0.5）');
+  ok(last.alpha < 0.10, '远端不透明度衰减到 0.10 以下（' + last.alpha.toFixed(3) + '）');
+  ok(last.alpha / first.alpha < 0.20,
+    '首尾不透明度之比 < 20%（' + ((last.alpha / first.alpha) * 100).toFixed(1) + '%）');
+
+  /* ── 覆盖深度：别用「截断」冒充「收缩」 ── */
+  ok(last.depth > 150,
+    '路沿一直画到 ' + last.depth.toFixed(0) + ' 米（> 150 米，不是早早砍掉了事）');
+
+  /* ── 与屏幕宽度无关：米制宽度的必然结果，固定像素做不到 ──
+   * 固定 3px 在 480 宽的窗口里比例碰巧是对的，换 1400 宽就只剩三分之一。 */
+  const canvasEl = env.w.document.getElementById('game');
+  Object.defineProperty(canvasEl, 'clientWidth', { value: 1400, configurable: true });
+  env.w.dispatchEvent(new env.w.Event('resize'));
+  const r2 = env.w.RD.curbSegments().map((s) => s.w / s.roadW);
+  ok(Math.abs(Math.max.apply(null, r2) - rMax) < 1e-9,
+    '画布 900 → 1400，比值一点不变（' + Math.max.apply(null, r2).toFixed(5) +
+    '）—— 因为宽度是米，不是像素');
+
+  env.w.close();
+}
+
 (async function () {
   try {
     await testA();
@@ -968,6 +1052,7 @@ async function testI() {
     await testG();
     await testH();
     await testI();
+    await testJ();
   } catch (e) {
     fail++;
     console.log('  [ERROR] ' + (e && e.stack ? e.stack.split('\n').slice(0, 4).join('\n') : e));

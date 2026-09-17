@@ -153,8 +153,16 @@ const inject = `
  * 必须落在项目根目录：index.html 里用的是 <script src="projector.js"> 这种相对路径，
  * 放 dev/ 下面会 ERR_FILE_NOT_FOUND，拍出来永远是加载页。 */
 const src = fs.readFileSync(path.join(DIR, 'index.html'), 'utf8');
+/* --game=_game-old.js：换一个 game.js 来拍。
+ * 改视觉时"改前 / 改后"要能拍成同构图两张图，靠肉眼记忆对比是自欺欺人。
+ * 旧版从 HEAD 取（git show HEAD:game.js > _game-old.js）—— 只读操作，
+ * 不要去 stash / checkout：这个仓库的 .git 有过一次不明原因的整目录消失。 */
+const gameArg = process.argv.find((a) => a.startsWith('--game='));
+const GAME = gameArg ? gameArg.slice(7) : 'game.js';
+if (/[^\w.\-]/.test(GAME)) throw new Error('--game 只接受文件名');
+const html = GAME === 'game.js' ? src : src.replace('src="game.js"', 'src="' + GAME + '"');
 const tmp = path.join(DIR, '_shot.html');
-fs.writeFileSync(tmp, src.replace('</body>', inject + '</body>'), 'utf8');
+fs.writeFileSync(tmp, html.replace('</body>', inject + '</body>'), 'utf8');
 const url = 'file:///' + tmp.replace(/\\/g, '/');
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
