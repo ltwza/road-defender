@@ -272,13 +272,16 @@
     /* 路面（远 → 近）、横向条纹的 rgb 三元组、分隔虚线的整条 rgba */
     road: ['#2c313d', '#232833', '#1a1e28'],
     stripe: '160,190,240',
-    dash: 'rgba(200,222,255,0.24)',
+    /* 分隔虚线：rgb 三元组 + 近端不透明度（远处靠 exp 衰减，见 drawRoad）。
+     * 和 curb 一个模式 —— alpha 必须能单独调，否则没法做"随距离淡出"。 */
+    dash: '200,222,255',
+    dashA: 0.24,
     /* 路沿：rgb 三元组 + 近端不透明度（远处靠 exp 衰减，见 drawCurb） */
     curb: '120,190,255',
     curbA: 0.55,
     curbGlowA: 0.16,
     /* 路肩碎石带 */
-    verge: '#141a24',
+    verge: '20,26,36',
     /* 空气透视：alpha = fogMin + (1−fogMin)·exp(−depth/fogD) */
     fogMin: 0.30,
     fogD: 75,
@@ -332,6 +335,65 @@
     return out;
   }
 
+  /* 色值 → [r,g,b]。要认三种写法：
+   *   'hex'（#abc / #aabbcc）、'r,g,b'（三元组，主题里给需要单独调 alpha 的用）、
+   *   'rgb(...)' —— 最后这个不是为了好看，而是因为 **mixColor 的输出会再被 mixColor 吃掉**
+   *   （路面远端先混一次地面色、再拿结果混一次路面色）。少了这一支，
+   *   parseInt('rgb(24') 就是 NaN，整块路面直接不画。 */
+  function rgbOf(c) {
+    if (typeof c !== 'string') return null;
+    var body = c;
+    var m = /^rgba?\(([^)]*)\)$/.exec(c);
+    if (m) body = m[1];
+    if (body.charAt(0) === '#') {
+      var h = body.slice(1);
+      if (h.length === 3) h = h[0] + h[0] + h[1] + h[1] + h[2] + h[2];
+      if (h.length !== 6 || /[^0-9a-fA-F]/.test(h)) return null;
+      return [parseInt(h.slice(0, 2), 16), parseInt(h.slice(2, 4), 16), parseInt(h.slice(4, 6), 16)];
+    }
+    var p = body.split(',');
+    if (p.length < 3 || p.length > 4) return null;
+    var out = [parseInt(p[0], 10), parseInt(p[1], 10), parseInt(p[2], 10)];
+    if (isNaN(out[0]) || isNaN(out[1]) || isNaN(out[2])) return null;
+    return out;
+  }
+
+  /* 两色混合：k=0 取 a，k=1 取 b。
+   * 解析不出来的色值按 k 取整返回原串 —— 主题是数据，
+   * 宁可画得难看一点，也不要 NaN 把整块画面变成黑色。 */
+  function mixColor(a, b, k) {
+    var A = rgbOf(a), B = rgbOf(b);
+    if (!A || !B) return k < 0.5 ? a : b;
+    return 'rgb(' + Math.round(A[0] + (B[0] - A[0]) * k) + ',' +
+                    Math.round(A[1] + (B[1] - A[1]) * k) + ',' +
+                    Math.round(A[2] + (B[2] - A[2]) * k) + ')';
+  }
+
+  /* 地面渐变的色标位置（远 → 近）。
+   * 抽成常量是因为 drawRoad 要让路面远端**收敛到同一屏幕 y 处的地面色** ——
+   * 两处各写一份位置，迟早会对不上，而症状是"远处路上浮着一条淡淡的带"，
+   * 很难联想到是两处拼写不同步。 */
+  var GROUND_STOPS = [0, 0.30, 1];
+
+  /* 路面渐变末段的色标：[位置, 残留对比度 s]。
+   *
+   * s 的含义是"路面还剩多少自己的颜色"：s=1 完全是柏油本色，s=0 完全是
+   * **同一屏幕 y 处**的地面色。
+   *
+   * 为什么是"连色相一起收敛"而不是"亮度对齐、色调照旧"：
+   *   大气对路面和地面是同一个介质、同一次衰减，于是
+   *       haze(road) − haze(ground) = (1 − a) · (road − ground)
+   *   —— 两者的**差**按 (1−a) 缩水，色相和亮度一起缩。
+   *   第一版写成"只借亮度"（scaleToLum），保住了柏油的灰调，代价是
+   *   远处路面和地面在色相上永远差着几十级：白天图草地绿、柏油灰，
+   *   实测 900 米处逐通道最大差 33 —— 路照样从背景里翻出来，
+   *   只是从"暗塔"换成了"浅灰带"。dev/persp.js 的判据 B 就是量这个。
+   *
+   * s 的斜率刻意取成缓变（3.0 → 3.25 → 3.14 → 2.29 每单位），
+   *   色标斜率的突变会在屏幕上留下一条横向亮暗带（马赫带），
+   *   这个坑在"末段收敛"的第一版上踩过，那条带比尖塔本身还显眼。 */
+  var ROAD_FADE = [[0.68, 1], [0.78, 0.70], [0.86, 0.44], [0.93, 0.22], [1, 0.06]];
+
   /* ── 地图（场景） ──
    * kinds = 三条景物带上各摆什么，按 SCENE.belts 的顺序一一对应。
    * 只写种类、不写坐标：位置仍由「世界里程 + 稳定哈希」推导（见 SCENE 注释），
@@ -367,11 +429,12 @@
                'rgba(255,255,255,0.22)', 'rgba(255,255,255,0)'],
         road: ['#8f8a80', '#7b766c', '#66625a'],
         stripe: '255,255,255',
-        dash: 'rgba(255,255,255,0.50)',
+        dash: '255,255,255',
+        dashA: 0.50,
         curb: '236,238,242',
         curbA: 0.42,
         curbGlowA: 0.06,
-        verge: '#6f6a60',
+        verge: '111,106,96',
         fogMin: 0.34,
         fogD: 95,
         vig: 0.22,
@@ -409,17 +472,24 @@
       over: {
         sky: ['#33406f', '#8a5a80', '#d4795a', '#f0b070'],
         ground: ['#c08a52', '#a8703f', '#6b4526'],
-        ridge: ['#7a4f52', '#5a3a42'],
-        treeLine: ['#4a2f34', '#3a252a'],
+        /* 远景剪影在沙漠里**不能真做成剪影**：日落时沙丘是被夕阳照亮的地形，
+         * 而沙地本身就亮（亮度 145）。原来那两个深紫褐（88 / 60）会在
+         * 地平线上压出一条暗带，紧贴着亮沙地，反差一百多级 —— 那正是
+         * "远处的景观怪怪的"的来源。现在改成越靠近地平线越接近沙色，
+         * 让远景平滑地融进地面：
+         *   天空 80 → 远丘 109 → 近丘 129 → 起伏 138~144 → 沙地 145 */
+        ridge: ['#8f6558', '#a87a55'],
+        treeLine: ['#b5834c', '#bb8a52'],
         haze: ['rgba(255,190,120,0)', 'rgba(255,180,110,0.10)',
                'rgba(255,170,100,0.24)', 'rgba(255,160,90,0)'],
         road: ['#8a7358', '#75604a', '#5f4d3c'],
         stripe: '255,220,170',
-        dash: 'rgba(255,232,190,0.34)',
+        dash: '255,232,190',
+        dashA: 0.34,
         curb: '255,208,150',
         curbA: 0.48,
         curbGlowA: 0.10,
-        verge: '#6d543a',
+        verge: '109,84,58',
         fogMin: 0.34,
         fogD: 58,
         vig: 0.40,
@@ -1428,6 +1498,11 @@
     drawBackdrop();
     if (road) drawRoad();
     drawScenery();
+    /* 大气层压在**所有远景元素**之上：路面、路肩、路沿、景物、灯笼都要被同一层雾衰减。
+     * 排在 drawEntities 之前是有意的 —— 妖物和玩家最远 120 米（屏幕 y≥356），
+     * 本来就在雾带范围之外，但顺序上明确隔开，免得将来雾带变厚时
+     * "雾盖住妖物"这种玩法级事故悄悄发生。 */
+    drawAir();
 
     if (G && (state === 'playing' || state === 'paused' || state === 'result')) {
       drawEntities();
@@ -1462,6 +1537,7 @@
   function drawRoad() {
     var th = theme();
     var far = road.crossSectionAtT(0.995);
+    var hy = road.vanish.y;          // 地平线 —— 地面渐变与它的色标都以这里为原点
     var scroll = currentScroll();
 
     // 路面主体
@@ -1472,9 +1548,37 @@
     ctx.lineTo(road.right0.x, road.right0.y);
     ctx.closePath();
     var rg = ctx.createLinearGradient(0, road.left0.y, 0, far.a.y);
+    /* 末端必须收敛到**同一屏幕 y 处的地面色**，而不是一个固定的 ground[0]：
+     * 地面自身的渐变还在继续往暗处走，钉死一个常量会在远端留下 2~3 级亮度差 ——
+     * 那点差刚好够让眼睛顺着两条直边一路看到消失点，也就是"焦点太清晰"。
+     * 按 y 反查地面渐变，两边才是同一个量。
+     *
+     * 渐变的**位置参数恰好等于 t**（屏幕 y 是 t 的线性函数），
+     * 所以色标可以直接读成透视深度：0.42→35 米，0.68→100 米，0.95→912 米。 */
+    function groundAtY(y) {
+      var pg = (y - hy) / (H - hy);
+      if (pg <= 0) return th.ground[0];
+      if (pg >= 1) return th.ground[GROUND_STOPS.length - 1];
+      for (var i = 0; i < GROUND_STOPS.length - 1; i++) {
+        if (pg <= GROUND_STOPS[i + 1]) {
+          var span = GROUND_STOPS[i + 1] - GROUND_STOPS[i];
+          return mixColor(th.ground[i], th.ground[i + 1], span > 0 ? (pg - GROUND_STOPS[i]) / span : 0);
+        }
+      }
+      return th.ground[GROUND_STOPS.length - 1];
+    }
+    var yN = road.left0.y, yF = far.a.y;
+    var gy = function (p) { return yN + (yF - yN) * p; };
+    /* 路面在 y 处的雾化色 = 「同一屏幕 y 处的地面色」掺上 s 份「柏油本色」。
+     * 等价于"先把路和地面的差按 (1−s) 缩水，再叠到地面上" ——
+     * 也就是 haze(road) = haze(ground) + (1−a)·(road − ground) 那个式子。
+     * 末段的色标表见上面 ROAD_FADE 的注释。 */
+    var fadeAt = function (y, s) { return mixColor(groundAtY(y), th.road[2], s); };
     rg.addColorStop(0, th.road[0]);
     rg.addColorStop(0.42, th.road[1]);
-    rg.addColorStop(1, th.road[2]);
+    for (var fi = 0; fi < ROAD_FADE.length; fi++) {
+      rg.addColorStop(ROAD_FADE[fi][0], fadeAt(gy(ROAD_FADE[fi][0]), ROAD_FADE[fi][1]));
+    }
     ctx.fillStyle = rg;
     ctx.fill();
 
@@ -1493,18 +1597,29 @@
       ctx.stroke();
     }
 
-    // 三条小路的分隔虚线（x = ±roadWidth/6）
+    /* 分隔虚线（x = ±roadWidth/6）。宽度必须用**米**、跟着透视收缩 ——
+     * 写死 px 的话远处那条线会一直保持同样的粗细和亮度，
+     * 等于在地平线上钉了一排小白点：这是"路的焦点太清晰"的另一半来源
+     * （另一半是路面的几何尖塔，见上面的渐变）。
+     * 0.035 米不是现实里的车道线宽度（真实是 0.10~0.15 米），
+     * 而是**从改动前的近端观感反推**的：2.2px ÷ 62.4px/m ≈ 0.035 米。
+     * 用户报的是远处，就别顺手把近处也改了。 */
     var dashPeriod = 6, dashLen = 3.1;
     var off2 = scroll % dashPeriod;
-    ctx.strokeStyle = th.dash;
-    ctx.lineWidth = 2.2;
     var bounds = [-CFG.roadWidth / 6, CFG.roadWidth / 6];
     for (var k = 0; k < bounds.length; k++) {
       for (var s = -off2; s < CFG.roadViewDepth; s += dashPeriod) {
         var y0 = Math.max(0.6, s), y1 = Math.min(CFG.roadViewDepth, s + dashLen);
         if (y1 - y0 < 0.5) continue;
+        var dm = (y0 + y1) / 2;
+        var dw = DASH.wM * pxPerMeter * (1 - road.tFromDepth(dm));
+        if (dw < DASH.minW) continue;         // 细到亚像素，画了也只是糊成灰线
+        var da = th.dashA * Math.exp(-dm / DASH.fogD);
+        if (da < 0.006) continue;             // 已淡到看不见，省一次 stroke
         var p0 = road.project(bounds[k], y0).pos;
         var p1 = road.project(bounds[k], y1).pos;
+        ctx.strokeStyle = 'rgba(' + th.dash + ',' + da.toFixed(3) + ')';
+        ctx.lineWidth = dw;
         ctx.beginPath();
         ctx.moveTo(p0.x, p0.y);
         ctx.lineTo(p1.x, p1.y);
@@ -1548,6 +1663,15 @@
     minW: 0.45,     // 细于此就不再绘制（亚像素只会糊成灰线）
     fogD: 110,      // 空气透视特征距离（米）
     segs: 36
+  };
+
+  /* 分隔虚线的几何，与路沿同一套做法：宽度用「米」跟着透视收缩，明度随距离指数衰减。
+   * 两者分开定义（而不是共用一张表）是因为"多细算看不见"的量级不同：
+   * 路沿是连续的发光细线，虚线是断续的白色短段。 */
+  var DASH = {
+    wM: 0.035,      // 宽度（米）—— 见 drawRoad 里解释为什么不是真实的 0.12
+    minW: 0.40,     // 细于此不再绘制（亚像素只会糊成灰线）
+    fogD: 110       // 空气透视特征距离（米），与路沿取同一个值
   };
   /* 颜色与不透明度走地图主题（夜/昼/沙漠的路沿不该是同一个色、同一个亮度）；
    * 宽度、分段数、衰减距离走上面这张几何表 —— 它们跟光照无关，跨地图不该变。
@@ -1633,9 +1757,9 @@
     // ① 铺地：地平线以下全部填成"地"。近处压暗、远处提亮 ——
     //    反过来做（近亮远暗）会立刻失去纵深。
     var gg = ctx.createLinearGradient(0, hy, 0, H);
-    gg.addColorStop(0, th.ground[0]);
-    gg.addColorStop(0.30, th.ground[1]);
-    gg.addColorStop(1, th.ground[2]);
+    for (var gi = 0; gi < GROUND_STOPS.length; gi++) {
+      gg.addColorStop(GROUND_STOPS[gi], th.ground[gi]);
+    }
     ctx.fillStyle = gg;
     ctx.fillRect(0, hy, W, H - hy);
 
@@ -1649,9 +1773,29 @@
     drawTreeLine(hy + 16, 12, 2.4, th.treeLine[0], scroll);
     drawTreeLine(hy + 24, 7, 3.4, th.treeLine[1], scroll);
 
-    // ③ 地平线雾带：把天与地接起来，同时给远景一层空气。
-    //    必须向上向下都渐隐到 0 —— 只在一端收边的话，屏幕上会出现一道横向硬边，
-    //    非常显眼（第一版就踩了这个坑）。
+    /* ③ 地平线雾带**不在这里画** —— 见 drawAir()。
+     *    它曾经就长在这一段下面，于是只洗到了天、山、树线和地面：
+     *    路面、路肩、景物全在它之后画，等于"这些玩意儿不受大气影响"。
+     *    后果是同一片远景里，地面被雾提亮、路面还是原来的暗色，
+     *    路的远端于是凸出来变成一座插在天际线上的暗色尖塔（实测比周围地面暗 17 级亮度）。
+     *    空气透视必须**作用于所有远景元素**，所以它得排在它们后面。 */
+  }
+
+  /* 空气透视层：一层贴着地平线的雾，向上向下都渐隐到 0。
+   *
+   * 为什么必须画在路面与景物**之后**：大气是一个"覆盖在整幅远景之上"的介质，
+   * 不是背景的一部分。谁在它之后画，谁就免于被大气衰减 —— 而真实世界里没有东西免得了。
+   *
+   * 两端都必须收边到 0：只在一端收的话屏幕上会出现一道横向硬边，非常显眼
+   * （第一版只收一边，踩过）。
+   *
+   * ⚠ 改这里必须同步改 renderMapThumb() —— 商城的缩略图走的是同一套绘制函数，
+   *   漏掉一处就会出现"预览和实机不一样"，而那种不一致最难被发现。
+   */
+  function drawAir() {
+    if (!road) return;
+    var th = theme();
+    var hy = road.vanish.y;
     var top = hy - H * 0.20, bot = hy + H * 0.12;
     var hz = ctx.createLinearGradient(0, top, 0, bot);
     hz.addColorStop(0, th.haze[0]);
@@ -1659,7 +1803,8 @@
     hz.addColorStop(0.625, th.haze[2]);   // 0.625 ≈ 地平线所在位置
     hz.addColorStop(1, th.haze[3]);
     ctx.fillStyle = hz;
-    ctx.fillRect(0, Math.max(0, top), W, bot - Math.max(0, top));
+    var y0 = Math.max(0, top);
+    ctx.fillRect(0, y0, W, bot - y0);
   }
 
   /* 一条山脊剪影。用 W、W/2、W/3… 为周期的正弦叠加 → 天然以屏宽为周期，
@@ -1667,7 +1812,8 @@
   function drawRidge(baseY, amp, par, color, scroll, phase) {
     var off = scroll * par;
     var bottom = road.vanish.y + 8;
-    ctx.fillStyle = color;
+    var g = silhouetteFill(color, baseY - amp, bottom);
+    ctx.fillStyle = g;
     ctx.beginPath();
     ctx.moveTo(-2, bottom);
     for (var x = -2; x <= W + 2; x += 6) {
@@ -1681,12 +1827,26 @@
     ctx.fill();
   }
 
+  /* 剪影的填充：主体是纯剪影色，**底边渐隐到地平线处的地面色**。
+   *
+   * 为什么必须渐隐：剪影的底边是一条水平直线。剪影色和地面色差得远时
+   * （沙漠图的远树线比沙地暗一百多级亮度），那条边就成了横贯屏幕的一道硬边，
+   * 看起来像"远处盖了块板子"。真实世界里的远景剪影是"从地面上长出来"的，
+   * 交界处被大气抹平 —— 这就是那层大气。 */
+  function silhouetteFill(color, top, bottom) {
+    var g = ctx.createLinearGradient(0, top, 0, bottom);
+    g.addColorStop(0, color);
+    g.addColorStop(0.65, color);
+    g.addColorStop(1, theme().ground[0]);
+    return g;
+  }
+
   /* 远树线：用 |sin| 叠出来的锯齿状剪影。
    * |sin| 的波峰是圆的、波谷是尖的，正好像一排树冠；
    * 频率取 W 的整数分频（×26、×47）保证以屏宽为周期，视差偏移不会出现接缝。 */
   function drawTreeLine(baseY, amp, par, color, scroll) {
     var off = scroll * par;
-    ctx.fillStyle = color;
+    ctx.fillStyle = silhouetteFill(color, baseY - amp, baseY + 4);
     ctx.beginPath();
     ctx.moveTo(-2, baseY + 4);
     for (var x = -2; x <= W + 2; x += 3) {
@@ -1700,15 +1860,26 @@
   }
 
   /* 路肩：贴着路沿的一条碎石带。作用很大 ——
-   * 没有它，路面像浮在虚空里的一个楔子；有了它，"路是修在地面上的"才成立。 */
+   * 没有它，路面像浮在虚空里的一个楔子；有了它，"路是修在地面上的"才成立。
+   *
+   * 远端必须淡出（而不是一路不透明画到 168 米）：它和路面一样受大气影响，
+   * 硬生生结束的话会在屏幕上留下一条横贯的直边 —— 而且那条边恰好落在
+   * 空气透视最该浓的地方，看着像"路肩上盖了块板子"。
+   * 淡出到透明就行了：它下面是已经画好的地面，自然露出来。 */
   function drawVerge() {
     var dx = 0.9;
-    ctx.fillStyle = theme().verge;
+    var th = theme();
     for (var side = -1; side <= 1; side += 2) {
       var i0 = road.project(side * CFG.roadWidth / 2, 0).pos;
       var iF = road.project(side * CFG.roadWidth / 2, 168).pos;
       var oF = road.project(side * (CFG.roadWidth / 2 + dx), 168).pos;
       var o0 = road.project(side * (CFG.roadWidth / 2 + dx), 0).pos;
+      var vg = ctx.createLinearGradient(0, i0.y, 0, iF.y);
+      vg.addColorStop(0, 'rgba(' + th.verge + ',1)');
+      vg.addColorStop(0.35, 'rgba(' + th.verge + ',0.82)');
+      vg.addColorStop(0.70, 'rgba(' + th.verge + ',0.34)');
+      vg.addColorStop(1, 'rgba(' + th.verge + ',0)');
+      ctx.fillStyle = vg;
       ctx.beginPath();
       ctx.moveTo(i0.x, i0.y);
       ctx.lineTo(iF.x, iF.y);
@@ -3228,7 +3399,7 @@
       roadWidth: CFG.roadWidth, k: 48, maxDepth: 420
     });
     withTarget(c2, tw, thh, pr, pr.nearWidthPx / CFG.roadWidth, key, function () {
-      drawSky(); drawBackdrop(); drawRoad(); drawScenery();
+      drawSky(); drawBackdrop(); drawRoad(); drawScenery(); drawAir();
     });
   }
 

@@ -60,12 +60,24 @@ const COINS_ARG = process.argv.find((a) => a.startsWith('--coins='));
 const COINS = COINS_ARG ? Math.max(0, parseInt(COINS_ARG.slice(8), 10) || 0) : null;
 const SEED = 20260916;
 const PORT = 9223;
-/* --probe=<js>：在页面里求值一句话，把结果打到终端。
+/* --probe=<js> / --probefile=<路径>：在页面里求值一段代码，把结果打到终端。
  * 截图只能告诉你"看起来不对"，看不出**为什么**不对 ——
  * 卡片文字整块不见了这种事，得去读真实 DOM 的 getBoundingClientRect / getComputedStyle。
  * 页面此时已经跑完注入脚本（该开的局、该进的商城都已经在状态里），
- * 所以这里可以直接量任何元素。 */
-const PROBE = (process.argv.find((a) => a.startsWith('--probe=')) || '').slice(8);
+ * 所以这里可以直接量任何元素。
+ *
+ * 探针一长就该走 --probefile：命令行参数里的换行和缩进在传递途中会被搅坏，
+ * 症状是"探针明明有返回值，但页面状态不对" —— 那种错最难查。
+ * 写文件传路径就没有这层转义。 */
+const PROBEFILE = (process.argv.find((a) => a.startsWith('--probefile=')) || '').slice(12);
+const PROBE = PROBEFILE
+  ? fs.readFileSync(path.resolve(PROBEFILE), 'utf8')
+  : ((process.argv.find((a) => a.startsWith('--probe=')) || '').slice(8));
+/* --bare：只留风景，清掉妖物/掉落/飘字。
+ * 量"远处的路和景物长什么样"时必须用它 —— 妖物钉在屏幕下半部分，
+ * 会把逐行的对比度统计整片抬起来，量出来的剖面是妖物的轮廓而不是场景的。
+ * 也让"这张地图本身好不好看"这件事能和玩法元素分开看。 */
+const BARE = process.argv.includes('--bare');
 
 /* 钉住的场景：妖物绝不越过玩家，构图每次一致。
  * 深度 17~86 米 → 覆盖"快到跟前 / 中景 / 远景"三档，正好能看出
@@ -93,6 +105,7 @@ const inject = `
   var GENDER = ${JSON.stringify(GENDER_ARG)};
   var COINS = ${COINS === null ? 'null' : COINS};
   var STAGE = ${JSON.stringify(STAGE)};
+  var BARE = ${BARE ? 'true' : 'false'};
   var s = SEED >>> 0;
   Math.random = function () { s = (s * 1664525 + 1013904223) >>> 0; return s / 4294967296; };
   var didOpen = false, didWrap = false;
@@ -160,6 +173,16 @@ const inject = `
         var G = D.G;
         G.t = 74;                          // HUD 显示个中局时间
         G.hp = 78; G.score = 1280;         // 血条留点信息量
+        if (BARE) {
+          /* 风景帧：一只妖物都不留。清完直接返回，不走下面的 STAGE 钉位 ——
+           * 钉位每帧会重新灌 STAGE.length 只回来，两边打架的话读到哪一帧全看运气。 */
+          if (!FIRE) G.fireTimer = 1e9;
+          G.monsters.length = 0;
+          if (G.pickups) G.pickups.length = 0;
+          G.floats.length = 0;
+          requestAnimationFrame(tick);
+          return;
+        }
         var b = { atk: 3, rate: 2, crit: 4, critDmg: 2 };
         if (WRAP) {
           if (!didWrap) {
@@ -317,6 +340,21 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
     console.log('events: ' + events.join(','));
     if (logs.length) console.log('page logs:\n  ' + logs.join('\n  '));
 
+    /* --noscenery：把装饰整体关掉，用来量"装饰到底花了多少"，或者量"纯背景有多亮"。
+     * 直接改 RD.SCENE 就行 —— 场景是按世界里程即时推导的，没有缓存状态。
+     *
+     * ⚠ 必须排在 PROBE **之前**：探针常常就是来量"去掉装饰之后画面长什么样"的，
+     *   顺序反了的话探针量到的还是带装饰的帧，而它自己毫不知情 ——
+     *   这种"数字看起来很正常，只是答的不是那个问题"最难查。
+     *   （原来就排在后面，是量路面 vs 地面时才发现的。） */
+    if (process.argv.includes('--noscenery')) {
+      await send('Runtime.evaluate', {
+        expression: 'RD.SCENE.belts.forEach(function(b){b.density=0;});' +
+          'RD.SCENE.lampSpacing=1e9;RD.SCENE.fireflies=0;'
+      });
+      await sleep(500);
+    }
+
     if (PROBE) {
       /* awaitPromise：探针可以返回 Promise，于是能"先造一个状态、等它演完再看"。
        * 例：把玩家打死 → await 600ms 让结算页真的出现 → 再截图。
@@ -329,16 +367,6 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
       } else {
         console.log('--probe → ' + JSON.stringify(r.result && r.result.result ? r.result.result.value : r, null, 2));
       }
-    }
-
-    /* --noscenery：把装饰整体关掉，用来量"装饰到底花了多少"。
-     * 直接改 RD.SCENE 就行 —— 场景是按世界里程即时推导的，没有缓存状态。 */
-    if (process.argv.includes('--noscenery')) {
-      await send('Runtime.evaluate', {
-        expression: 'RD.SCENE.belts.forEach(function(b){b.density=0;});' +
-          'RD.SCENE.lampSpacing=1e9;RD.SCENE.fireflies=0;'
-      });
-      await sleep(500);
     }
 
     /* --pick=x,y;x,y 直接读画布像素。
