@@ -897,6 +897,66 @@ async function testH() {
   env.w.close();
 }
 
+/* ═══════════════ 测试 I：移动端视口与安全区 ═══════════════
+ * 这一组钉的是「手机上面板下半截被裁、还拉不动」那类缺陷。
+ * 它的特点是**在电脑上完全正常**，所以只能靠契约断言守着：
+ * 移动浏览器的 100vh 是"大视口"（地址栏收起时的高度），比真实可视区高
+ * （iPhone 竖屏实测差 100~140px）。#app 按它撑高，HUD 底部就被锚到屏幕外；
+ * 而属性面板的 max-height 也是按大视口算的，于是它并**不溢出**，
+ * 怎么拉都拉不动 —— 看着像面板坏了，其实是整块被浏览器 UI 盖住。 */
+async function testI() {
+  console.log('\n=== 测试 I：移动端视口与安全区 ===');
+  const html = fs.readFileSync(path.join(DIR, 'index.html'), 'utf8');
+  const raw = fs.readFileSync(path.join(DIR, 'game.js'), 'utf8');
+
+  /* ── 静态契约：少任何一条，手机上就会出上面那个症状 ── */
+  ok(html.indexOf('--vh-full:100vh') > 0, ':root 里 --vh-full 有 vh 兜底（老浏览器）');
+  ok(html.indexOf('@supports (height:100dvh)') > 0 && html.indexOf('--vh-full:100dvh') > 0,
+    '--vh-full 在支持 dvh 时改用 100dvh（跟随真实可视区）');
+  ok(/#app\{[^}]*height:var\(--vh-full\)/.test(html), '#app 高度走 var(--vh-full)');
+  ok(!/#app\{[^}]*height:100vh/.test(html), '#app 不再直接用 100vh（那会在手机上被裁）');
+  ok(!/\.stat-panel\{[^}]*max-height:36vh/.test(html),
+    '属性面板不再用裸 36vh（它按大视口算，算出来的空间在手机上并不存在）');
+  ok(/\.stat-panel\{[^}]*max-height:calc\(var\(--vh-full\)/.test(html),
+    '属性面板 max-height 基于 var(--vh-full)');
+  ok(html.indexOf('env(safe-area-inset-bottom') > 0, '#hud 底部让出 iPhone Home 条');
+  ok(html.indexOf('viewport-fit=cover') > 0,
+    'viewport meta 带 viewport-fit=cover（否则 safe-area 恒为 0）');
+
+  /* ── game.js 侧的兜底链路 ── */
+  ok(/function syncViewportHeight/.test(raw), 'game.js 有 syncViewportHeight()');
+  ok(/visualViewport[\s\S]{0,120}?\.height/.test(raw),
+    'syncViewportHeight 读的是 visualViewport.height（比 vh 准）');
+  ok(/function resize\(\)\s*\{\s*syncViewportHeight\(\)/.test(raw), 'resize() 每次都会重新同步');
+  ok(/visualViewport\.addEventListener\('resize'/.test(raw),
+    '监听了 visualViewport 的 resize（iOS 上地址栏伸缩不一定派发 window.resize）');
+
+  /* ── 真跑一遍：值必须"跟着变化走"，而不是一次性写死 ── */
+  const env = makeEnv();
+  loadScripts(env.w);
+  await waitHome(env);
+  const de = env.w.document.documentElement;
+
+  Object.defineProperty(env.w, 'visualViewport', {
+    value: { height: 704, width: 390, addEventListener() {} }, configurable: true
+  });
+  env.w.dispatchEvent(new env.w.Event('resize'));
+  ok(de.style.getPropertyValue('--vh-full') === '704px',
+    '可视高 704 → --vh-full 写成 704px（真的按可视区走，不是死钉 100vh）');
+
+  env.w.visualViewport.height = 640;
+  env.w.dispatchEvent(new env.w.Event('resize'));
+  ok(de.style.getPropertyValue('--vh-full') === '640px',
+    '可视高改成 640 → --vh-full 跟着变（地址栏伸缩能跟上）');
+
+  delete env.w.visualViewport;
+  env.w.dispatchEvent(new env.w.Event('resize'));
+  ok(de.style.getPropertyValue('--vh-full') === env.w.innerHeight + 'px',
+    '没有 visualViewport 的老内核回落到 innerHeight（' + env.w.innerHeight + 'px）');
+
+  env.w.close();
+}
+
 (async function () {
   try {
     await testA();
@@ -907,6 +967,7 @@ async function testH() {
     await testF();
     await testG();
     await testH();
+    await testI();
   } catch (e) {
     fail++;
     console.log('  [ERROR] ' + (e && e.stack ? e.stack.split('\n').slice(0, 4).join('\n') : e));

@@ -307,7 +307,24 @@
   var W = 0, H = 0, DPR = 1;
   var road = null, pxPerMeter = 1, vignette = null;
 
+  /* 把 --vh-full 钉成"真实可视高度"（px）。
+   *
+   * 为什么需要它：移动浏览器的 `100vh` 是**大视口** —— 地址栏收起时的高度，
+   * 比真实可视区高（iPhone 竖屏实测差 100~140px）。#app 按它撑高，整个 HUD 底部
+   * 就被锚到屏幕外面，血条和属性面板下半截被浏览器 UI 盖住；而面板自身并不溢出，
+   * 所以"怎么拉都拉不动"，看着像面板坏了。电脑端没有地址栏，因此只在手机上出事。
+   *
+   * CSS 那边已经用 dvh 解决（见 index.html 的 :root 注释），这里再兜一层：
+   * 微信旧 X5 内核不认识 dvh，而 visualViewport 覆盖面更广，且给的是实测像素。
+   * 地址栏伸缩、切前后台都会改变可视区，所以每次 resize 都要重新同步。 */
+  function syncViewportHeight() {
+    var vv = window.visualViewport;
+    var h = (vv && vv.height) || window.innerHeight;
+    if (h > 0) document.documentElement.style.setProperty('--vh-full', h + 'px');
+  }
+
   function resize() {
+    syncViewportHeight();
     DPR = Math.min(window.devicePixelRatio || 1, 2);
     W = canvas.clientWidth || window.innerWidth;
     H = canvas.clientHeight || window.innerHeight;
@@ -2223,6 +2240,11 @@
   function boot() {
     resize();
     window.addEventListener('resize', resize);
+    /* 地址栏伸缩在 iOS 上不一定派发 window.resize，但一定会动 visualViewport。
+     * 不顺带听这个的话，手指一划让地址栏收起来，HUD 就会和屏幕底错位。 */
+    if (window.visualViewport) {
+      window.visualViewport.addEventListener('resize', resize);
+    }
     bindInput();
     bindUI();
 

@@ -25,11 +25,22 @@
 <meta name="twitter:card" content="summary_large_image">
 <style>
   *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  /* 可视高度变量 —— 移动端最容易踩的一个坑，单独说明：
+     移动浏览器的 100vh 指"大视口"（地址栏收起时的高度），**比真实可视区高**，
+     iPhone 竖屏实测差 100~140px。而 #app 是按它撑高的，于是整个 HUD 底部
+     被锚到了屏幕外面：血条和属性面板下半截被浏览器 UI 盖住。
+     更迷惑的是属性面板此时并**没有**溢出（max-height 也是按大视口算的），
+     所以怎么拉都拉不动 —— 看着就像"面板坏了"，其实是整块被裁。
+     桌面浏览器没有地址栏，100vh == 可视高度，所以这个问题只在手机上出现。
+     dvh 跟随实际可视区；老内核（微信旧 X5）不支持 dvh 时，
+     再由 game.js 的 syncViewportHeight() 用 visualViewport 实测覆盖，双保险。 */
+  :root{--vh-full:100vh}
+  @supports (height:100dvh){:root{--vh-full:100dvh}}
   html,body{margin:0;height:100%;overflow:hidden;background:#0b0d12;
     font-family:system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif;
     color:#e8eaf0;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none;
     overscroll-behavior:none}
-  #app{position:relative;width:100vw;height:100vh;overflow:hidden}
+  #app{position:relative;width:100vw;height:var(--vh-full);overflow:hidden}
   #game{position:absolute;inset:0;width:100%;height:100%;display:block;
     touch-action:none;cursor:grab}
   #game:active{cursor:grabbing}
@@ -71,7 +82,11 @@
 
   /* ---------- HUD ---------- */
   #hud{position:absolute;inset:0;z-index:10;pointer-events:none;
-    padding:14px 16px;display:flex;flex-direction:column}
+    /* 底部额外让出 iPhone 的 Home 条（safe-area）。少了这句，全面屏手机上
+       卡片会贴着最下面那条横线，跟它抢位置。两者都要：vw 那一层是"被浏览器 UI 遮挡"，
+       这一层是"被系统手势条遮挡"。 */
+    padding:14px 16px calc(14px + env(safe-area-inset-bottom,0px));
+    display:flex;flex-direction:column}
   #hud button{pointer-events:auto}
   .hud-top{display:flex;align-items:flex-start;gap:14px}
   .time-wrap{flex:1;display:flex;flex-direction:column;align-items:flex-start;gap:5px;padding-top:2px}
@@ -131,7 +146,8 @@
   .stat-panel{margin:9px -12px -11px;padding:9px 12px 11px;
     border-top:1px solid rgba(255,255,255,.09);
     background:rgba(6,9,14,.58);border-radius:0 0 14px 14px;
-    max-height:36vh;overflow-y:auto;display:flex;flex-direction:column;gap:7px}
+    max-height:calc(var(--vh-full) * .36);
+    overflow-y:auto;display:flex;flex-direction:column;gap:7px}
   .stat-panel.hidden{display:none}
   .stat-panel::-webkit-scrollbar{width:3px}
   .stat-panel::-webkit-scrollbar-thumb{background:rgba(255,255,255,.2);border-radius:99px}
