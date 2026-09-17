@@ -134,6 +134,7 @@ node dev/balance-test.js    # 27 项数值护栏
 node dev/stand180.js        # 站桩 12 局：应当基本全败（威胁是真实的）
 node dev/diag.js            # 233ms 反应延迟的自动玩家：应当能通关（难度不是不可能的）
 node dev/aimdiag.js         # 弹道诊断：各武器的命中发数与真实命中/发射比
+node dev/spreaddiag.js      # 散布口径：固定角度 vs 固定米数，跑真实投影器算屏幕偏移
 node dev/shot.js xxx --dpr=2 --perf   # 实机截图 + 渲染耗时
 ```
 
