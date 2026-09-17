@@ -519,8 +519,11 @@ async function testE() {
     hut: 2.15,        // 屋宽 4.3
     gate: 4.08,       // 檐口 ±w×0.92
     pagoda: 2.30,
-    /* ── 以下 7 种是沙漠图专属 ── */
-    cactus: 0.58,     // 右臂：w*0.5(0.15) + u*0.26 + 臂宽 u*0.26
+    /* ── 以下 10 种是沙漠图专属 ── */
+    cactus: 0.64,     // 右臂外沿 w*0.5(0.21) + u*0.26 − u*0.09 + 臂宽 u*0.26
+    cactusClump: 0.86, // 最宽一丛：5 片摊开 0.72w0 + 半片 0.27w0（w0 最大 0.74）
+    yucca: 0.45,      // 剑叶尖 ±u*0.42 再 + 线宽一半
+    deadbush: 0.40,   // 枯枝尖 ±u*0.38 再 + 线宽一半
     dune: 0.70,       // 丘宽最大 1.4 → 半径 0.7（迎风坡那瓣 w*0.38 更窄）
     mesa: 2.30,       // 台面宽最大 4.6 → ±2.3
     ruin: 0.83,       // 柱宽 0.96，脚边碎块外沿 w*0.86
@@ -571,8 +574,62 @@ async function testE() {
     '沙漠图里出现了沙漠专属物件（cactus/dune/mesa）');
   ok(!nightKinds.has('cactus') && !nightKinds.has('mesa') && !nightKinds.has('obelisk'),
     '夜景里不会冒出仙人掌/台地/方尖碑（换地图真的换了种类，不是只换了颜色）');
-  ok(desertKinds.has('palm') !== nightKinds.has('palm'),
-    'palms 只属于沙漠 —— 种类是按地图选的，不是三张图共用一套');
+  /* ④d 沙漠里不许长树 —— 这条是用户直接点出来的："沙漠里怎么会有树"。
+   *     上一版沙漠的第二/三带铺的是 palm、第一带还塞了两个 grass，
+   *     画出来是一片棕榈林；更糟的是棕榈叶读到了**夜图**的深绿（见 ④e）。
+   *     查 beltsFor 的**数据**而不是采样出来的 kindSet：采样只有 4 个里程，
+   *     碰巧没抽到某个种类就等于放过它。 */
+  const TREE_KINDS = ['pine', 'broadleaf', 'bamboo', 'palm', 'grass', 'bush'];
+  const desertFlat = D.beltsFor('desert').reduce((a, b) => a.concat(b.kinds), []);
+  const treesInDesert = TREE_KINDS.filter((k) => desertFlat.indexOf(k) >= 0);
+  ok(treesInDesert.length === 0, '沙漠里不种树也不长草（查到的：' +
+    (treesInDesert.join('/') || '无') + '）');
+  const nCactus = desertFlat.filter((k) => k === 'cactus' || k === 'cactusClump').length;
+  ok(nCactus >= 3, '仙人掌是沙漠的主体：' + desertFlat.length + ' 个槽位里占 ' + nCactus + ' 个');
+  ok(nightKinds.has('pine') || nightKinds.has('broadleaf'),
+    '别的地图照旧有树 —— 修的是沙漠，不是把树从整个世界删掉');
+
+  /* ④e 主题完整性：某张地图用到的**每一种道具**，它读的每个 th.xxx 都必须在
+   *     **这张图自己的 over.P** 里显式写过。
+   *     为什么非要"显式"：主题是 deepMerge 出来的，缺的键会安静地回落到 BASE_THEME。
+   *     这次的 bug 正是如此 —— 新加的沙漠道具只把色值写在了 BASE_THEME，
+   *     于是沙漠图的仙人掌与棕榈叶读到的其实是**夜图**的深绿，在黄沙上绿得刺眼，
+   *     而代码一个错都不报；沙丘/台地那几个碰巧也是沙色才没露馅，纯属运气。
+   *     依赖关系直接从 PROPS 源码里扫，省得再手抄一张会和代码走散的对照表。 */
+  const propColors = {};
+  (() => {
+    const src = fs.readFileSync(path.join(DIR, 'game.js'), 'utf8');
+    const s0 = src.indexOf('var PROPS = {');
+    const body = src.slice(s0, src.indexOf('\n  };', s0));
+    const parts = body.split(/\n    (\w+): function \(bx, by, u, r\) \{/);
+    for (let i = 1; i < parts.length; i += 2) {
+      const ks = {};
+      /* ⚠ 必须带 \b：不加的话 Math.floor / Math.max / Math.PI 里的
+       *   "…th." 会被当成主题键扫出来（Math 的尾巴正好是 th），
+       *   于是三张图一起报"缺 floor/max/PI"这种根本不存在的色值。 */
+      (parts[i + 1].match(/\bth\.([A-Za-z0-9_]+)/g) || []).forEach((m) => { ks[m.slice(3)] = 1; });
+      propColors[parts[i]] = Object.keys(ks);
+    }
+  })();
+  ok(Object.keys(propColors).length >= 15, '从 PROPS 源码里扫出 ' +
+    Object.keys(propColors).length + ' 种道具的配色依赖');
+  MAPKEYS.forEach((mk) => {
+    const md = D.MAPS.filter((x) => x.key === mk)[0];
+    const exp = (md && md.over && md.over.P) || D.theme(mk).P;   // 基准图没有 over，它自己就是源
+    const merged = D.theme(mk).P;
+    const notExp = {}, undef = {};
+    D.beltsFor(mk).reduce((a, b) => a.concat(b.kinds), []).forEach((k) => {
+      (propColors[k] || []).forEach((key) => {
+        if (exp[key] === undefined) notExp[k + '.' + key] = 1;
+        if (merged[key] === undefined) undef[k + '.' + key] = 1;
+      });
+    });
+    const a = Object.keys(notExp), b = Object.keys(undef);
+    ok(a.length === 0, '[' + mk + '] 用到的色值都在本图 over.P 里显式写过' +
+      (a.length ? '（缺 ' + a.join('、') + ' —— 会静默回落到基准主题，画出来是别张图的颜色）' : ''));
+    ok(b.length === 0, '[' + mk + '] 合并后的主题里没有 undefined 色值' +
+      (b.length ? '（' + b.join('、') + '）' : ''));
+  });
 
   /* ⑤ 数量有界：scroll 拉到极远，可见物件数必须仍落在同一区间里。
    *    注意不能断言"恒定" —— 每条带是按等间距槽位取的，进出视野的槽位是否被

@@ -294,13 +294,12 @@
       stalkA: '#122219', stalkB: '#16291e', leafC: '#193023',
       pole: '#151d27', cloth: '#1e2c40', emblem: 'rgba(206,228,255,0.26)',
       wall: '#1d2735', roof: '#26313f', window: 'rgba(255,188,112,0.62)',
-      eave: 'rgba(0,0,0,0.35)', stone: '#0a1017', tower: '#0d141d',
-      cactus: '#3f7048', cactusDark: '#2f5a38',
-      dune: '#c99a63', duneTop: '#e0b478',
-      mesa: '#a87c4e', mesaTop: '#c99a63',
-      ruin: '#b09a78', ruinTop: '#8f7c5e',
-      tent: '#c2a97e', tentDark: '#8a7454',
-      palmLeaf: '#3f5a35', palmLeaf2: '#4d6b3f'
+      eave: 'rgba(0,0,0,0.35)', stone: '#0a1017', tower: '#0d141d'
+      /* ⚠ 这里**只放夜里会用到的键**。沙漠专属的（仙人掌/沙丘/台地/断柱/帐篷/棕榈）
+       *   一律写在 desert 的 over.P 里 —— 曾经把它们写在这儿，
+       *   于是沙漠图的仙人掌与棕榈叶读的是**夜图**的深绿，在黄沙上绿得刺眼。
+       *   deepMerge 不会报错，只会安静地给你一个不该出现的颜色。
+       *   dev/e2e-test.js 测试 L 现在会逐道具核对"用到的每个键都在本图 over.P 里"。 */
     },
     /* 石灯笼：白天地图里"不点灯"，于是只改这几个色，几何一律不动 */
     lamp: {
@@ -399,9 +398,14 @@
     {
       key: 'desert', name: '大漠孤烟', sub: '黄昏 · 沙丘', price: 8800,
       desc: '落日把沙丘压成剪影。仙人掌、断柱、商队的帐篷。',
-      kinds: [['grass', 'rock', 'cactus', 'rock', 'banner', 'dune', 'grass'],
-              ['cactus', 'dune', 'palm', 'ruin', 'tent', 'rock'],
-              ['palm', 'ruin', 'obelisk', 'mesa', 'cactus']],
+      /* 沙漠图**不收真树**（松/阔叶/竹一概没有），第一带也不放草 ——
+       * 上一次这里铺的是 grass 与 palm，画出来是一片棕榈林，草还是绿的。
+       * 主体改成仙人掌：近处矮丛（cactusClump）、中景柱状（cactus），
+       * 远景靠台地/断柱/方尖碑撑天际线。
+       * palm（绿洲棕榈）的道具和配色都留着，想加一段绿洲就把它塞进第三带。 */
+      kinds: [['dune', 'rock', 'cactusClump', 'yucca', 'banner', 'cactusClump', 'deadbush'],
+              ['cactus', 'dune', 'ruin', 'cactus', 'tent', 'rock'],
+              ['mesa', 'cactus', 'ruin', 'obelisk', 'mesa']],
       over: {
         sky: ['#33406f', '#8a5a80', '#d4795a', '#f0b070'],
         ground: ['#c08a52', '#a8703f', '#6b4526'],
@@ -421,14 +425,21 @@
         vig: 0.40,
         flies: 9,
         P: {
-          grass: '#8a7340', bush: '#6b6a34', bushTop: '#7a7a3d',
+          /* 这里只列**沙漠图真正画得到的**道具色值。
+           * 沙丘/台地/断柱/帐篷本来就该是沙石色，跟地平线同调；
+           * 植物则刻意压暗、去饱和 —— 落日是逆光，饱和的绿会像贴上去的贴纸。 */
           rock: '#8a7355', rockTop: '#9c8465',
-          trunk: '#4a3524', pineA: '#5a4a30', pineB: '#4a3c26',
-          leafA: '#3f5a35', leafB: '#4d6b3f', edge: 'rgba(255,224,170,0.30)',
-          stalkA: '#3d6b45', stalkB: '#4a7a50', leafC: '#5a8a5c',
+          dune: '#c99a63', duneTop: '#e0b478',
+          mesa: '#a87c4e', mesaTop: '#c99a63',
+          ruin: '#b09a78', ruinTop: '#8f7c5e',
+          tent: '#c2a97e', tentDark: '#8a7454',
           pole: '#5a4330', cloth: '#a8483a', emblem: 'rgba(255,235,190,0.5)',
-          wall: '#b09a78', roof: '#8a7050', window: 'rgba(255,200,120,0.60)',
-          eave: 'rgba(0,0,0,0.30)', stone: '#8f7c5e', tower: '#a08a68'
+          trunk: '#4a3524',
+          cactus: '#5f8046', cactusDark: '#42583a', cactusFlower: '#ffb89e',
+          cactusClump: '#57733f', cactusClumpTop: '#6b8a4c',
+          yucca: '#7d8f4e', yuccaDark: '#637440',
+          deadbush: '#7a6242', deadbushTop: '#9a7d52',
+          palmLeaf: '#7d8a4a', palmLeaf2: '#8f9b58'
         },
         lamp: {
           pole: '#6b5238', body: '#7d6244', core: '#ffd07a',
@@ -2108,7 +2119,15 @@
     /* 柱状仙人掌：主干 + 两条上举的臂 */
     cactus: function (bx, by, u, r) {
       var th = theme().P;
-      var h = (1.15 + r() * 0.95) * u, w = u * 0.30;
+      var h = (2.4 + r() * 2.0) * u, w = u * 0.42;
+      /* 极远处（整株只剩几个像素高）：只留一根实心短柱就收工。
+       * 那时候主干本身才一两像素宽，两条臂会退化成更细的线，
+       * 整条远景带看着像一片飘着的噪点 —— 少画两笔反而更像"远处的仙人掌"。 */
+      if (h < 4) {
+        ctx.fillStyle = th.cactus;
+        ctx.fillRect(bx - 0.75, by - h, 1.5, Math.max(1, h));
+        return;
+      }
       ctx.fillStyle = th.cactus;
       ctx.fillRect(bx - w * 0.5, by - h, w, h);
       var armH = h * 0.42, armW = w * 0.62;
@@ -2119,6 +2138,66 @@
       ctx.fillRect(bx + w * 0.5 + u * 0.26 - u * 0.09, ay2 - armH * 0.86, u * 0.26, u * 0.09);
       ctx.fillStyle = th.cactusDark;            // 背光的一侧
       ctx.fillRect(bx - w * 0.5, by - h, w * 0.34, h);
+      /* 顶上一朵花：落日下最跳的一点色，也是"这是仙人掌、不是一根柱子"的提示。
+       * 用位置派生而不是 r() —— PROPS 的 r 是共享的随机序列，多调一次会让
+       * 后面所有物件的随机值整体错位，固定种子的截图对照就全废了。 */
+      if (Math.abs(bx * 0.013) % 1 < 0.55) {
+        ctx.fillStyle = th.cactusFlower;
+        ctx.beginPath();
+        ctx.arc(bx, by - h - u * 0.07, u * 0.12, 0, 6.283);
+        ctx.fill();
+      }
+    },
+
+    /* 团扇仙人掌：贴路带的矮丛，几片扁掌叠着长。
+     * 它顶替的是原来第一带里的 grass —— 沙漠里那丛"绿草"是最出戏的一处。 */
+    cactusClump: function (bx, by, u, r) {
+      var th = theme().P;
+      var n = 3 + Math.floor(r() * 3);
+      /* 宽度受"最坏横向半宽 0.86 米"约束（第一带 minX=2.72，路面半宽 2.0，
+       * 探入上限 0.30）—— 长得再大就得挪出贴路带，不能再往路边挤。 */
+      var w0 = (0.52 + r() * 0.22) * u;
+      for (var i = 0; i < n; i++) {
+        var dx = (i - (n - 1) / 2) * w0 * 0.36 + (r() - 0.5) * w0 * 0.16;
+        var hh = w0 * (0.72 + r() * 0.5), ww = w0 * (0.52 + r() * 0.20);
+        ctx.fillStyle = i % 2 ? th.cactusClump : th.cactusClumpTop;
+        ctx.beginPath();
+        ctx.ellipse(bx + dx, by - hh * 0.52, ww * 0.5, hh * 0.5, 0, 0, 6.283);
+        ctx.fill();
+      }
+    },
+
+    /* 丝兰：一丛剑状硬叶。沙漠里的"草"就该长这样 —— 细、尖、发灰，
+     * 而不是阔叶草那一撮软绿。 */
+    yucca: function (bx, by, u, r) {
+      var th = theme().P;
+      var n = 7 + Math.floor(r() * 4), H = (0.62 + r() * 0.52) * u;
+      ctx.lineWidth = Math.max(1, u * 0.055);
+      ctx.lineCap = 'round';
+      for (var i = 0; i < n; i++) {
+        var t = (i / (n - 1) - 0.5) * 2, hh = H * (0.62 + r() * 0.5);
+        ctx.strokeStyle = i % 2 ? th.yucca : th.yuccaDark;
+        ctx.beginPath();
+        ctx.moveTo(bx, by);
+        ctx.quadraticCurveTo(bx + t * u * 0.12, by - hh * 0.70, bx + t * u * 0.42, by - hh);
+        ctx.stroke();
+      }
+    },
+
+    /* 枯木丛：干裂的放射枝条，替掉沙漠里同样不该有的那丛浑圆绿灌木 */
+    deadbush: function (bx, by, u, r) {
+      var th = theme().P;
+      var n = 6 + Math.floor(r() * 5), H = (0.45 + r() * 0.38) * u;
+      ctx.lineWidth = Math.max(1, u * 0.042);
+      ctx.lineCap = 'round';
+      for (var i = 0; i < n; i++) {
+        var t = (i / (n - 1) - 0.5) * 2, hh = H * (0.50 + r() * 0.60);
+        ctx.strokeStyle = i % 2 ? th.deadbush : th.deadbushTop;
+        ctx.beginPath();
+        ctx.moveTo(bx, by);
+        ctx.quadraticCurveTo(bx + t * u * 0.14, by - hh * 0.75, bx + t * u * 0.38, by - hh);
+        ctx.stroke();
+      }
     },
 
     /* 小沙丘（贴路带用）：只留一道弧 */
