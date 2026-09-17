@@ -45,9 +45,26 @@
     dragSensitivity: 1.0
   };
 
-  /* shots 发数；fan 为相邻两发之间的夹角（弧度）；pierce 为可多穿几个目标。
+  /* shots 发数；spreadM 为"齐射在目标所在深度处散开多少米"；pierce 为可多穿几个目标。
    * desc 是给属性面板用的一句话特性说明 —— 刻意只写"手感"，不写数字，
-   * 数字全部由面板从 cd/dmg/shots/fan/pierce 现算，避免两处写死对不上。 */
+   * 数字全部由面板从 cd/dmg/shots/spreadM/pierce 现算，避免两处写死对不上。
+   *
+   * ⚠ spreadM 的单位必须是"米"，不要换回"相邻两发的夹角（弧度）"。
+   * 这两把武器最初用的是固定夹角 0.12 / 0.20 弧度，是硬伤：
+   * 妖物在 17 米（ATTACK.range）才进入交火，而 0.20 弧度在 17 米处横向偏
+   * 17·tan(0.20) = 3.45 米 —— 妖物判定半径只有 0.76 米（半径 0.44 + 弹道 0.32），
+   * 路半宽也才 2 米。于是两侧的剑一出手就飞到路外：双股剑 17 米外两发全空、
+   * 三才剑阵三发只中一发，真实命中率 62% / 47%，比初始飞剑还弱。
+   * 夹角给的是"随距离越散越开的绝对角度"，米给的是"和距离无关的宽度" ——
+   * 后者才是玩家对"并射 / 齐射"的心理模型。动这两个数之前先看 e2e 测试 H。
+   *
+   * ⚠ 多发武器的单发伤害（9 / 8）低于初始飞剑（13），同样是刻意的，别顺手调回 12。
+   * 齐射能全中之后，实际 dps = dmg × shots ÷ cd：9 / 8 对应 34.6 / 35.3，
+   * 而 12 会到 46 / 53 —— 高过「小妖血量 20 ÷ 预警 0.5 秒 = 40」这条线，
+   * 妖物在扑到之前就被打死，站着不动反而无敌（这正是起始飞剑注释里的那条教训）。
+   * 实测把 dmg 留成 12 时，dev/stand180.js 的站桩通关率从 8% 飙到 42%（12 局里 5 局通关）；
+   * 回到 9 / 8 后是 1/12，与修复前一致。改这两个数之前先跑 stand180
+   * 和 dev/balance-test.js 第 5 节（那里有一条以"发呆阈值"为准的反向护栏）。 */
   var WEAPONS = {
     /* 起始飞剑：低射速、高单发。
      * 两点都是踩坑踩出来的：
@@ -55,10 +72,10 @@
      *    单发 6 点时会变成"开 300 枪、命中率 92%、只打死 6 只"（单杀耗伤 250）；
      *  · dps 也不能太高 —— 高于（小妖血量 ÷ 预警时长）的话，
      *    妖物还没扑到就被打死，站着不动反而无敌。 */
-    sword: { key: 'sword', name: '飞剑', desc: '单发直线，稳而沉', cd: 0.80, dmg: 13, shots: 1, fan: 0, pierce: 0, color: '#8fd8ff' },
-    twin: { key: 'twin', name: '双股剑', desc: '双道并射，出手最快', cd: 0.52, dmg: 12, shots: 2, fan: 0.12, pierce: 0, color: '#9dffd7' },
-    fan: { key: 'fan', name: '三才剑阵', desc: '三才扇面，覆盖最广', cd: 0.68, dmg: 12, shots: 3, fan: 0.20, pierce: 0, color: '#ffd98f' },
-    cloud: { key: 'cloud', name: '穿云剑', desc: '单发最重，一贯三', cd: 0.80, dmg: 40, shots: 1, fan: 0, pierce: 3, color: '#ffa8dd' }
+    sword: { key: 'sword', name: '飞剑', desc: '单发直线，稳而沉', cd: 0.80, dmg: 13, shots: 1, spreadM: 0, pierce: 0, color: '#8fd8ff' },
+    twin: { key: 'twin', name: '双股剑', desc: '双道并射，出手最快', cd: 0.52, dmg: 9, shots: 2, spreadM: 0.9, pierce: 0, color: '#9dffd7' },
+    fan: { key: 'fan', name: '三才剑阵', desc: '三发齐出，火力最密', cd: 0.68, dmg: 8, shots: 3, spreadM: 0.5, pierce: 0, color: '#ffd98f' },
+    cloud: { key: 'cloud', name: '穿云剑', desc: '单发最重，一贯三', cd: 0.80, dmg: 40, shots: 1, spreadM: 0, pierce: 3, color: '#ffa8dd' }
   };
   var WEAPON_KEYS = ['sword', 'twin', 'fan', 'cloud'];
 
@@ -648,13 +665,22 @@
 
     var oy = CFG.playerY + 1.4;
     var tgt = aimTarget();
-    var base = Math.atan2(tgt ? tgt.y3d - oy : 60, tgt ? tgt.x3d - G.x3d : 0);
+    var aimX = tgt ? tgt.x3d : G.x3d;
+    var aimY = tgt ? tgt.y3d : oy + 60;
+    /* 与目标的深度差：夹住下界，免得妖物贴脸扑过来时 atan2 在小分母上算出横飞的角 */
+    var dy = aimY - oy;
+    if (dy < 2.5) dy = 2.5;
 
     var n = st.w.shots;
+    var spread = st.w.spreadM || 0;
     G.shotsFired += n;
     for (var i = 0; i < n; i++) {
-      var off = n === 1 ? 0 : (i - (n - 1) / 2) * st.w.fan;
-      var a = base + off;
+      /* 散布的口径是"米"，不是角度 —— 见 WEAPONS 上方关于 spreadM 的注释。
+       * 瞄准点直接挪到「目标位置横向 ±offM 米」，角度由这一点现算，
+       * 于是"在最外侧那一发，在目标那个深度上离目标中心多远"永远等于 offM，
+       * 和远近无关：0.55 米的散布在 12 米和 60 米处都是 0.55 米。 */
+      var offM = n === 1 ? 0 : (i - (n - 1) / 2) * spread;
+      var a = Math.atan2(dy, aimX + offM - G.x3d);
       var crit = Math.random() < st.crit;
       G.bullets.push({
         x3d: G.x3d,
@@ -1942,8 +1968,8 @@
     r.push({ k: '单发伤害', v: st.dmg.toFixed(1) });
     r.push({ k: '攻击间隔', v: st.cd.toFixed(2) + ' 秒' });
     r.push({ k: '期望每秒伤害', v: st.dps.toFixed(1) });
-    r.push({ k: '弹道', v: st.shots + ' 发' + (w.fan > 0
-      ? ' · 张角 ' + ((st.shots - 1) * w.fan * 57.2958).toFixed(0) + '°' : ' · 直线') });
+    r.push({ k: '弹道', v: st.shots + ' 发' + (w.spreadM > 0
+      ? ' · 展宽 ' + ((st.shots - 1) * w.spreadM).toFixed(1) + ' 米' : ' · 直线') });
     r.push({ k: '穿透', v: w.pierce > 0 ? '可穿 ' + w.pierce + ' 个目标' : '无' });
     r.push({ full: '特性：' + w.desc });
     r.push({ sep: true });

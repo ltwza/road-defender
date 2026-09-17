@@ -40,6 +40,10 @@ const CLIP = clipArg ? clipArg.slice(7).split(',').map(Number) : null;
  * DPR 1 测出来的数字对手机（DPR 2~3）没有参考价值。 */
 const dprArg = process.argv.find((a) => a.startsWith('--dpr='));
 const DPR = dprArg ? Math.max(1, Math.min(3, parseInt(dprArg.slice(6), 10) || 1)) : 1;
+/* --weapon=fan 指定手上拿哪把武器。
+ * 默认 twin 是历史原因（HUD 截图的落点），拍齐射弹道时要显式指定。 */
+const weaponArg = process.argv.find((a) => a.startsWith('--weapon='));
+const WEAPON = weaponArg ? weaponArg.slice(9) : 'twin';
 const SEED = 20260916;
 const PORT = 9223;
 
@@ -61,6 +65,7 @@ const inject = `
 (function () {
   var SEED = ${SEED}, FIRE = ${keepFire ? 'true' : 'false'}, HOME = ${process.argv.includes('--home') ? 'true' : 'false'};
   var OPEN = ${process.argv.includes('--stats') ? 'true' : 'false'};
+  var WEAPON = ${JSON.stringify(WEAPON)};
   var WRAP = ${process.argv.includes('--wrap') ? 'true' : 'false'};
   var STAGE = ${JSON.stringify(STAGE)};
   var s = SEED >>> 0;
@@ -109,7 +114,7 @@ const inject = `
           for (var w2 = 0; w2 < WRAP_N; w2++) b['t' + w2] = 1;
         }
         G.buffs = b;
-        G.weapon = 'twin';
+        G.weapon = WEAPON;
         if (!FIRE) G.fireTimer = 1e9;      // 关掉开火 → 画面更干净
         if (OPEN && !didOpen) { didOpen = true; D.toggleStats(true); }
 

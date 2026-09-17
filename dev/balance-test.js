@@ -35,10 +35,12 @@ const MONSTERS = {
   elite: { hp: 115, speed: 1.6, r: 0.66, dmg: 18, windup: 0.64, dash: 9 }
 };
 const WEAPONS = {
-  sword: { cd: 0.80, dmg: 13, shots: 1 },
-  twin: { cd: 0.52, dmg: 12, shots: 2 },
-  fan: { cd: 0.68, dmg: 12, shots: 3 },
-  cloud: { cd: 0.80, dmg: 40, shots: 1 }
+  /* spreadM：齐射在目标所在深度处散开的相邻间距（米）。
+   * 单位是米不是弧度 —— 弧度会让散布随距离线性放大，见 game.js 里 WEAPONS 上方的注释。 */
+  sword: { cd: 0.80, dmg: 13, shots: 1, spreadM: 0 },
+  twin: { cd: 0.52, dmg: 9, shots: 2, spreadM: 0.9 },
+  fan: { cd: 0.68, dmg: 8, shots: 3, spreadM: 0.5 },
+  cloud: { cd: 0.80, dmg: 40, shots: 1, spreadM: 0 }
 };
 const DROP = { pHeal: 0.24, pWep: 0.08, pBuff: 0.22, heal: 26 };
 
@@ -181,8 +183,20 @@ const endRates = Object.keys(base).filter((k) => k !== 'sword').map((k) => base[
 ok(Math.max(...endRates) < 1.0,
   '末期即使换到最好的裸装武器，清怪率也 < 100%（' + f(Math.max(...endRates) * 100) +
   '%）→ 后期一定有漏网之鱼，不会退化成无脑挂机');
-ok(Math.min(...endRates) > 0.25,
-  '末期捡到任意一把武器都能保持 ' + f(Math.min(...endRates) * 100) + '% 以上的清怪率 —— 玩家仍能还手');
+/* 下限用 20% 而不是 25%：
+ * 末期压力是 160 HP/秒，想清到 25% 就得有 40 dps，而 40 dps 已经高过
+ * 「小妖血量 20 ÷ 预警 0.5 秒 = 40」这条线 —— 妖物会在扑到之前就被打死，
+ * 站着不动反而无敌（实测：多发武器的单发伤害保持 12 时，站桩通关率从 8% 飙到 42%）。
+ * 所以这里只要求"换武器后清怪率至少翻倍"（飞剑 10.4% → 34.6 dps 的 22.2%），
+ * 而不是一个把难度打穿的绝对值。 */
+ok(Math.min(...endRates) > 0.20,
+  '末期捡到任意一把武器都能保持 ' + f(Math.min(...endRates) * 100) + '% 以上的清怪率（飞剑的 ' +
+  f(Math.min(...endRates) / (base.sword / hpPerSecEnd)) + ' 倍）—— 玩家仍能还手');
+// 反向护栏：这一条才是"不能站桩无敌"的数值版，和 dev/stand180.js 互为印证
+const idlThreshold = Math.min(...Object.keys(MONSTERS).map((k) => MONSTERS[k].hp / MONSTERS[k].windup));
+ok(Math.min(base.twin, base.fan) < idlThreshold,
+  '多发武器 dps ' + f(Math.min(base.twin, base.fan)) + ' < 发呆阈值 ' + f(idlThreshold) +
+  '（最弱妖物血量 ÷ 它的预警时长）—— 妖物仍能活着扑到面前，站桩不会变成无敌');
 ok(base.twin > base.sword && base.cloud > base.twin * 0.9,
   '换到进阶武器确实有提升（' + f(base.sword) + ' → ' + f(base.twin) + ' → ' + f(base.cloud) + ' dps）');
 
@@ -207,12 +221,18 @@ console.log('\n=== 7. 子弹判定 ===');
   ok(lo <= 0 && hi >= step, fps + 'fps：扫掠区间覆盖整段位移（' + f(step, 2) + 'm/帧）');
   console.log('  ' + fps + 'fps：子弹每帧 ' + f(step, 2) + 'm，判定区间 [' + f(lo, 2) + ', ' + f(hi, 2) + '] 无盲区');
 });
-// 瞄准辅助下，横向摆幅是否仍落在命中半径内
-const fanWorst = Math.max(...Object.keys(WEAPONS).map((k) => WEAPONS[k].shots > 1 ? 0.20 : 0));
-const lateral = Math.sin(fanWorst) * CFG.bulletSpeed / 60;
-console.log('  最大张角 ' + f(fanWorst, 2) + ' rad → 每帧横移 ' + f(lateral, 2) + 'm，命中半径最小 ' +
-  f(MONSTERS.bat.r + 0.32, 2) + 'm');
-ok(lateral < MONSTERS.bat.r + 0.32, '扇射最外侧弹道每帧横移小于最小命中半径，不会漏判');
+// 齐射散布：最外侧那一发在目标所在深度处，离目标中心多远
+const minTol = MONSTERS.bat.r + 0.32;
+console.log('  最小命中半径（飞蝠） ' + f(minTol, 2) + 'm');
+Object.keys(WEAPONS).forEach((k) => {
+  const w = WEAPONS[k];
+  const worst = ((w.shots - 1) / 2) * (w.spreadM || 0);
+  console.log('  ' + k.padEnd(6) + ' ' + w.shots + ' 发 → 最外侧偏离 ' + f(worst, 2) + 'm' +
+    (w.shots > 1 ? '（齐射展宽 ' + f((w.shots - 1) * w.spreadM, 2) + 'm）' : ''));
+  // 超出命中半径 = 那一发在设计上必然打空，不是精度问题。
+  // 历史 bug：曾经用固定夹角 0.20 弧度，17 米处偏 3.45m，三发只中一发。
+  if (w.shots > 1) ok(worst < minTol, k + ' 最外侧弹道偏离 ' + f(worst, 2) + 'm < 命中半径 ' + f(minTol, 2) + 'm（齐射可全中同一目标）');
+});
 
 console.log('\n==== 结果: ' + pass + ' 通过 / ' + fail + ' 失败 ====');
 process.exit(fail ? 1 : 0);

@@ -813,6 +813,90 @@ async function testG() {
   old.w.close();
 }
 
+/* ═══════════════ 测试 H：齐射弹道 ═══════════════
+ * 多发武器（双股剑 / 三才剑阵）的散布口径必须是"米"，不是"相邻两发的夹角"。
+ * 这是踩过的坑：原先用固定夹角 0.12 / 0.20 弧度，而妖物要到 17 米（ATTACK.range）
+ * 才进入交火 —— 0.20 弧度在 17 米处横向偏 17·tan(0.20) = 3.45 米，
+ * 而妖物判定半径只有 0.76 米（半径 0.44 + 弹道 0.32），路半宽也才 2 米。
+ * 于是"开了枪、子弹全从怪旁边飞过去"：双股剑 17 米外两发全空、三才剑阵永远只中一发。
+ *
+ * 这条用例不看代码怎么写，只看结果：每帧挤掉系统刷的怪、只留一只钉死位置的靶子，
+ * 开一枪，数实际命中了几发。用的是游戏真实的命中判定，不复制一份逻辑进来。 */
+async function testH() {
+  console.log('\n=== 测试 H：齐射弹道（多发武器必须全部命中）===');
+  const env = makeEnv();
+  env.w.Math.random = seeded(909);
+  loadScripts(env.w);
+  await waitHome(env);
+  env.w.document.getElementById('btnStart').click();
+
+  const D = env.w.RD;
+  const CFG = D.CFG, WP = D.WEAPONS, MON = D.MONSTERS;
+  const target = MON.slime;                  // 小妖：场上最常见的靶子
+  const TOL_WORST = MON.bat.r + 0.32;        // 解析判据按最严的一档（飞蝠）算
+
+  function salvo(wkey, dist, relX) {
+    let G = D.G;
+    G.bullets.length = 0; G.drops.length = 0; G.aimLock = null;
+    G.bulletHits = 0; G.shotsFired = 0;
+    G.weapon = wkey; G.fireTimer = 0;
+    const px = 0;                            // 玩家钉在中列
+    G.x3d = px;
+    const m = {
+      key: target.key, type: target,
+      x3d: px + relX, y3d: CFG.playerY + dist,
+      hp: 1e9, maxHp: 1e9, speed: 0, r: target.r, dmg: 0,
+      wob: 0, mode: 'walk', modeT: 0, lungeX: 0, hitFlash: 0, dead: false
+    };
+    const fx = m.x3d, fy = m.y3d;
+    const frames = Math.ceil((dist + 8) / CFG.bulletSpeed / 0.01667) + 4;
+    env.step(frames, 16.67, () => {
+      G = D.G;
+      G.monsters.length = 0;                 // 场上有几只怪、在哪，全由本用例说了算
+      G.monsters.push(m);
+      m.x3d = fx; m.y3d = fy; m.hp = 1e9; m.dead = false;
+      m.mode = 'walk'; m.modeT = 0;
+      G.weapon = wkey; G.x3d = px;
+      G.buffs = { atk: 0, rate: 0, crit: 0, critDmg: 0 };   // 去掉词条：只测弹道，不测伤害
+      if (G.shotsFired > 0) G.fireTimer = 1e9;               // 只允许开一枪
+    });
+    return { fired: G.shotsFired, hits: G.bulletHits };
+  }
+
+  const DISTS = [8, 12, 17, 25, 40, 60];
+  const WKEYS = ['sword', 'twin', 'fan', 'cloud'];
+
+  /* ① 解析判据：最外侧那一发在目标深度处离目标中心多远，必须小于命中半径。
+   *    和下面"真开枪"互为对照 —— 解析说能全中，实弹就必须全中。 */
+  WKEYS.forEach((k) => {
+    const w = WP[k];
+    if (w.shots === 1) return;
+    const worst = ((w.shots - 1) / 2) * w.spreadM;
+    ok(worst < TOL_WORST, WP[k].name + ' 最外侧偏离 ' + worst.toFixed(2) + 'm < 命中半径 ' +
+      TOL_WORST.toFixed(2) + 'm（齐射展宽 ' + ((w.shots - 1) * w.spreadM).toFixed(1) + 'm）');
+    ok(w.spreadM > 0, WP[k].name + ' 的齐射确实散开了（spreadM = ' + w.spreadM +
+      '），不是几发重叠在一起冒充多段伤害');
+  });
+
+  /* ② 实弹：逐武器 × 逐距离 × 正前方/侧路，数真实命中发数 */
+  for (const k of WKEYS) {
+    const w = WP[k];
+    const rows = [];
+    let allHit = true;
+    for (const relX of [0, 4 / 3]) {
+      for (const dist of DISTS) {
+        const r = salvo(k, dist, relX);
+        if (r.fired !== w.shots || r.hits !== r.fired) allHit = false;
+        rows.push(dist + 'm' + (relX ? '侧' : '') + ' ' + r.hits + '/' + r.fired);
+      }
+    }
+    console.log('  ' + w.name + '：' + rows.join('　'));
+    ok(allHit, w.name + ' 在 8~60 米、正前方与侧路都全部命中');
+  }
+
+  env.w.close();
+}
+
 (async function () {
   try {
     await testA();
@@ -822,6 +906,7 @@ async function testG() {
     await testE();
     await testF();
     await testG();
+    await testH();
   } catch (e) {
     fail++;
     console.log('  [ERROR] ' + (e && e.stack ? e.stack.split('\n').slice(0, 4).join('\n') : e));
